@@ -1,0 +1,27 @@
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      - DB_PATH=/data/marro.duckdb
+      - API_KEY=${API_KEY}
+      # Orígenes del frontend separados por coma, o * para cualquiera.
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      # true = los GET no piden API key (el frontend no necesita guardarla).
+      - PUBLIC_READ=${PUBLIC_READ:-false}
+      - MAX_ROWS=10000
+      - MAX_EXPORT_ROWS=200000
+      # Sincronización con NASA FIRMS (opcional). Sin FIRMS_MAP_KEY no se activa.
+      - FIRMS_MAP_KEY=${FIRMS_MAP_KEY:-}
+      - FIRMS_SYNC_HOURS=${FIRMS_SYNC_HOURS:-0}
+      - FIRMS_SYNC_AREA=${FIRMS_SYNC_AREA:--90.13,13.15,-87.68,14.45}
+      - FIRMS_SYNC_SOURCES=${FIRMS_SYNC_SOURCES:-VIIRS_SNPP_NRT,VIIRS_NOAA20_NRT,VIIRS_NOAA21_NRT,MODIS_NRT}
+      - FIRMS_SYNC_DAYS=${FIRMS_SYNC_DAYS:-2}
+    volumes:
+      # Mismo volumen que usaba el contenedor del CLI: reutiliza el archivo .duckdb
+      - duckdb_data:/data
+    expose:
+      - "8080"
+
+volumes:
+  duckdb_data:

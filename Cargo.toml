@@ -1,0 +1,22 @@
+[package]
+name = "marro-api"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# "bundled" compila DuckDB desde el código fuente: no necesitas instalar nada en el sistema.
+# 1.20000.x = DuckDB 2.0.0 (misma versión que el CLI duckdb/duckdb:2.0.0).
+duckdb = { version = "~1.20000.0", features = ["bundled"] }
+# CORS para que el frontend pueda llamar a la API desde el navegador.
+tower-http = { version = "0.6", features = ["cors"] }
+# Lectura y escritura de CSV (importación FIRMS y descarga).
+csv = "1"
+# Cliente HTTP para descargar de la API de FIRMS (TLS en Rust puro, sin OpenSSL).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[profile.release]
+strip = true
