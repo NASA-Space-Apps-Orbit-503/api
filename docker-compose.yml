@@ -3,7 +3,7 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      - DB_PATH=/data/marro.duckdb
+      - DB_PATH=/data/nasa.duckdb
       - API_KEY=${API_KEY}
       # Orígenes del frontend separados por coma, o * para cualquiera.
       - CORS_ORIGINS=${CORS_ORIGINS:-*}
