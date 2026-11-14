@@ -39,6 +39,8 @@ jobs:
     # Only publish from main so `latest` always reflects the production branch.
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    # Registry credentials live as secrets of the `production` environment.
+    environment: production
     permissions:
       contents: read
     steps:
@@ -70,6 +72,9 @@ jobs:
     name: Notify Dokploy
     needs: docker
     runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api-nasa.fopinet.com
     steps:
       # GitHub-style push payload so Dokploy can read the branch and commit message.
       - name: Send deploy webhook
