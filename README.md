@@ -1,4 +1,4 @@
-# marro-api
+# api-nasa
 
 API HTTP en Rust para el calendario de actividad de quema (NASA Space Apps · *Harmonization of MODIS and VIIRS Hot Spots*). Guarda los hotspots de MODIS y VIIRS en una base **DuckDB**, los armoniza y calcula para cualquier área el calendario, la climatología mensual y las anomalías.
 

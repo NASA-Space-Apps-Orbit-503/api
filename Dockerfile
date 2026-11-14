@@ -15,7 +15,7 @@ FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=build /app/target/release/marro-api /usr/local/bin/marro-api
+COPY --from=build /app/target/release/api-nasa /usr/local/bin/api-nasa
 ENV PORT=8080
 EXPOSE 8080
-CMD ["marro-api"]
+CMD ["api-nasa"]

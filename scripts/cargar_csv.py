@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Carga CSV de NASA FIRMS (MODIS y VIIRS) a marro-api.
+"""Carga CSV de NASA FIRMS (MODIS y VIIRS) a api-nasa.
 
 Hace dos pasos:
   1. Lee uno o varios CSV de FIRMS y genera UN CSV normalizado con las columnas
@@ -323,7 +323,7 @@ def subir(ruta: Path, api_url: str, api_key: str, modo: str, tamano: int, desde_
 # ---------------------------------------------------------------- main
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Normaliza CSV de FIRMS y los sube a marro-api.")
+    ap = argparse.ArgumentParser(description="Normaliza CSV de FIRMS y los sube a api-nasa.")
     ap.add_argument("entradas", nargs="+", help="Archivos CSV o carpetas con CSV de FIRMS")
     ap.add_argument("-o", "--salida", default="detecciones_normalizadas.csv",
                     help="CSV normalizado a generar (por defecto %(default)s)")

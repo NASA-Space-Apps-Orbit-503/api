@@ -1,4 +1,4 @@
-//! marro-api: API HTTP en Rust para el calendario de actividad de quema
+//! api-nasa: API HTTP en Rust para el calendario de actividad de quema
 //! (NASA Space Apps · Harmonization of MODIS and VIIRS Hot Spots).
 //!
 //! La configuración completa está en `config.rs` y en el README.
@@ -65,7 +65,7 @@ async fn main() {
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
-        .user_agent("marro-api")
+        .user_agent("api-nasa")
         .build()
         .expect("no se pudo crear el cliente HTTP");
 
@@ -104,7 +104,7 @@ async fn main() {
         .await
         .expect("no se pudo abrir el puerto");
     println!(
-        "marro-api escuchando en :{port} (base: {}, spatial: {spatial}, lectura pública: {})",
+        "api-nasa escuchando en :{port} (base: {}, spatial: {spatial}, lectura pública: {})",
         state.cfg.db_path, state.cfg.public_read
     );
     axum::serve(listener, app).await.unwrap();
