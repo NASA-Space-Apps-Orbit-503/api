@@ -38,7 +38,7 @@ API HTTP en Rust para el calendario de actividad de quema (NASA Space Apps · *H
 | Elegir un rango de fechas | Filtros `from` y `to` |
 | Calendario de actividad desde los 2000 a hoy | `GET /stats/calendar` |
 | Qué meses y años tienen más fuegos | `GET /stats/summary` y `GET /stats/climatology` |
-| Comparar el mes actual con la mediana histórica | `GET /stats/anomaly` |
+| Detectar anomalías por celda y día frente a la historia | `GET /stats/anomalies` |
 | Descargar un CSV de los hotspots de la búsqueda | `GET /detections?format=csv` |
 | Datos de NASA FIRMS | `POST /detections/import`, `POST /firms/sync` y sincronización automática |
 
@@ -56,8 +56,9 @@ src/
 ├── auth.rs                  # header x-api-key (y lectura pública opcional)
 ├── error.rs                 # formato único de errores
 ├── validation.rs            # validaciones compartidas (fechas, horas, rangos…)
-├── filters.rs               # filtros de área, fechas, instrumento, satélite, confianza
-├── analytics.rs             # /stats/*: calendario, climatología, anomalía, resumen
+├── filters.rs               # filtros de área, tiempo, instrumento, satélite, confianza; filter[...]
+├── analytics.rs             # /stats/*: calendario, climatología, resumen
+├── anomalies.rs             # /stats/anomalies: anomalías por celda y día
 ├── firms.rs                 # lectura de CSV FIRMS, descarga y sincronización
 ├── explorer.rs              # /health, /tables, /query
 └── entities/
@@ -229,7 +230,8 @@ export SV="bbox=-90.13,13.15,-87.68,14.45"     # El Salvador
 |--------|-----------------------|------------------------------------------------------|
 | GET    | `/stats/calendar`     | Serie por mes o por día (con ceros)                  |
 | GET    | `/stats/climatology`  | Mediana, promedio, etc. de cada mes entre años       |
-| GET    | `/stats/anomaly`      | Un mes contra el mismo mes de años anteriores        |
+| GET    | `/stats/anomalies`    | Anomalías por celda y día (paginado, ordenable)      |
+| GET    | `/stats/anomalies/{id}` | Una anomalía por id                                |
 | GET    | `/stats/summary`      | Totales, años y meses con más actividad              |
 | POST   | `/firms/sync`         | Descargar de FIRMS e importar                        |
 | GET    | `/health`             | Estado del servicio (siempre público)                |
@@ -288,12 +290,24 @@ Los aceptan `GET /detections`, todo `/stats/*` y `POST /burning-activity-stats/r
 | `lat`, `lon`, `radius_km` | `lat=13.7&lon=-89.2&radius_km=25` | Círculo alrededor de un punto |
 | `polygon`        | `{"type":"Polygon","coordinates":[...]}` (codificado en la URL) | Área dibujada en el mapa (GeoJSON) |
 | `from`, `to`     | `2001-01-01`, `2024-12-31`            | Rango de fechas inclusivo |
+| `date`           | `2024-03-14`                          | Un día exacto |
+| `year`           | `2023,2024`                           | Uno o varios años |
+| `month`          | `3,4`                                 | Uno o varios meses (1..12) |
+| `day`            | `1,15`                                | Uno o varios días del mes (1..31) |
 | `instrument`     | `MODIS,VIIRS`                         | Uno o varios instrumentos |
 | `satellite`      | `N,N20,Terra`                         | Uno o varios satélites |
 | `min_confidence` | `low` \| `nominal` \| `high`          | Confianza mínima armonizada |
 | `daynight`       | `D` \| `N`                            | Solo de día o de noche |
 
-El área se indica de **una sola** forma. Para las estadísticas, además:
+El área se indica de **una sola** forma. Los filtros se combinan con AND. `GET /burning-activity-stats` acepta `year`, `month` y `day`.
+
+**Sintaxis `filter[...]`** (estilo spatie/laravel-query-builder): cada filtro también se puede mandar como `filter[nombre]=valor`. Un `filter[...]` desconocido responde `400` con la lista de permitidos, en vez de ignorarse.
+
+```bash
+curl -H "x-api-key: $KEY" "$API/detections?filter[bbox]=-90.13,13.15,-87.68,14.45&filter[month]=3&filter[day]=14"
+```
+
+Para las estadísticas, además:
 
 | Parámetro  | Por defecto | Descripción |
 |------------|-------------|-------------|
@@ -339,29 +353,42 @@ curl -H "x-api-key: $KEY" "$API/stats/calendar?$SV&from=2001-01-01"
 
 Para cada mes del año (1–12): `median`, `mean`, `stddev`, `min`, `max`, `p25`, `p75`, cuántos años entran (`years`) y qué año tuvo el máximo (`max_year`). Sirve para la línea de "normal histórico" y para escalar la rampa de colores.
 
-### Anomalía: `GET /stats/anomaly`
+### Anomalías: `GET /stats/anomalies`
 
-Compara un mes contra el mismo mes de los años anteriores. Por defecto, el mes actual. **Si es el mes en curso, compara solo hasta el mismo día del mes en todos los años** (`partial_month: true`), para que la comparación sea justa.
+Divide el área en celdas de `cell_deg` grados (por defecto `0.1` ≈ 11 km) y, para cada celda y día con actividad, compara las detecciones **observadas** con las **esperadas**: el promedio diario de esa celda en el mismo mes de los años anteriores (desde el primer año con datos del área).
+
+- `score = 2 · (√(observed + 3/8) − √(expected + 3/8))`: desviación de Poisson con la transformación de Anscombe. Se lee como un z-score y está definida aunque lo esperado sea 0.
+- `severity`: `low` ≥ 2, `moderate` ≥ 3, `high` ≥ 5, `extreme` ≥ 8 (por debajo, `normal`).
+- Los filtros de tiempo eligen **qué días** se reportan; la referencia siempre usa todos los años anteriores.
+
+| Parámetro            | Por defecto | Descripción |
+|----------------------|-------------|-------------|
+| `cell_deg`           | `0.1`       | Tamaño de celda (0.001 a 1) |
+| `min_baseline_years` | `3`         | Años anteriores mínimos para tener referencia |
+| `min_score`          | `2`         | Score mínimo |
+| `severity`           | —           | `low,moderate,high,extreme` (uno o varios) |
+| `sort`               | `-score`    | `score`, `-score`, `date`, `-date`, `observed`, `-observed` |
+| `limit`, `offset`    | `100`, `0`  | Paginación |
 
 ```bash
-curl -H "x-api-key: $KEY" "$API/stats/anomaly?$SV"              # mes actual
-curl -H "x-api-key: $KEY" "$API/stats/anomaly?$SV&year=2024&month=4"
+curl -H "x-api-key: $KEY" "$API/stats/anomalies?$SV&year=2024&month=3&severity=high,extreme"
 ```
 
 ```json
 {
-  "metric": "cells", "cell_deg": 0.01,
-  "year": 2024, "month": 4, "partial_month": false, "compared_days": null,
-  "count": 412, "max_frp": 310.2, "rank": 2,
-  "baseline": { "years": 23, "first_year": 2001, "last_year": 2023,
-                "median": 250, "mean": 268.4, "stddev": 90.1, "min": 98, "max": 530 },
-  "anomaly": { "vs_median": 162, "vs_median_pct": 64.8, "vs_mean": 143.6,
-               "z_score": 1.59, "category": "above" },
-  "history": [ { "year": 2001, "count": 210, "max_frp": 150.0 } ]
+  "cell_deg": 0.1, "total": 42, "limit": 100, "offset": 0,
+  "items": [
+    { "id": "2024-03-14_0.1_136_-893", "date": "2024-03-14",
+      "location": { "latitude": 13.65, "longitude": -89.25, "cell_deg": 0.1 },
+      "observed": 37, "expected": 1.8, "ratio": 20.6, "score": 9.28, "severity": "extreme",
+      "max_frp": 88.1, "baseline_years": 23 }
+  ]
 }
 ```
 
-`category`: `much_below` / `below` / `normal` / `above` / `much_above` (por z-score ±1 y ±2), o `no_baseline` si no hay años anteriores.
+`GET /stats/anomalies/{id}` devuelve una sola. El id codifica fecha y celda; se recalcula con los filtros de área y atributos de la query (usa los mismos que en el listado para obtener el mismo valor).
+
+> Para comparar sensores con resoluciones distintas, filtra por `instrument` (por ejemplo `instrument=MODIS`): VIIRS existe desde 2012 y detecta más píxeles por incendio.
 
 ### Resumen: `GET /stats/summary`
 
@@ -446,12 +473,12 @@ DuckDB solo permite un proceso con escritura a la vez: por eso hay que detener l
 
 | Código | Cuándo |
 |--------|--------|
-| `400`  | JSON mal formado, tipo incorrecto, campo desconocido, filtro inválido, SQL inválido |
+| `400`  | JSON mal formado, tipo incorrecto, campo desconocido, filtro inválido o `filter[...]` desconocido, SQL inválido |
 | `401`  | Falta `x-api-key` o es incorrecta |
 | `404`  | No existe un registro con ese id |
 | `409`  | Duplicado (instrumento o detección) o `instrument` inexistente |
 | `413`  | Arreglo con más elementos que `MAX_BULK`, o cuerpo mayor que `MAX_BODY_MB` |
-| `422`  | Valor fuera de las reglas; CSV con filas inválidas (con lista de errores); mes futuro en `/stats/anomaly` |
+| `422`  | Valor fuera de las reglas; CSV con filas inválidas (con lista de errores) |
 | `501`  | Se pidió `polygon` y el servidor no tiene la extensión spatial |
 | `502`  | FIRMS respondió con error (MAP_KEY inválida, límite de uso…) |
 | `503`  | Falta `FIRMS_MAP_KEY`, o `/health` no llega a la base |
@@ -484,9 +511,9 @@ const { data: calendar } = await api.GET("/stats/calendar", {
   params: { query: { bbox: "-90.13,13.15,-87.68,14.45", from: "2001-01-01" } },
 });
 
-// ¿Cómo va este mes frente a la historia?
-const { data: anomaly } = await api.GET("/stats/anomaly", {
-  params: { query: { bbox: "-90.13,13.15,-87.68,14.45" } },
+// Anomalías graves de marzo de 2024
+const { data: anomalies } = await api.GET("/stats/anomalies", {
+  params: { query: { bbox: "-90.13,13.15,-87.68,14.45", year: "2024", month: "3", severity: "high,extreme" } },
 });
 
 // Enlace de descarga del CSV de la búsqueda actual

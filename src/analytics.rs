@@ -10,7 +10,8 @@
 //! Endpoints:
 //!   GET /stats/calendar     serie por mes o por día, con ceros en los periodos sin actividad
 //!   GET /stats/climatology  por mes del año: mediana, promedio, mínimo, máximo... entre años
-//!   GET /stats/anomaly      un mes contra el mismo mes de los años anteriores
+//!
+//! Las anomalías por celda y día están en `anomalies.rs` (`/stats/anomalies`).
 //!   GET /stats/summary      totales, años y meses con más actividad
 
 use axum::{
@@ -99,7 +100,7 @@ pub fn daily_sql(filter: &SqlFilter, metric: &Metric) -> String {
 }
 
 /// Ejecuta una consulta con parámetros y mapea cada fila.
-fn query_rows<T>(
+pub(crate) fn query_rows<T>(
     conn: &Connection,
     sql: &str,
     params: &[Value],
@@ -112,7 +113,7 @@ fn query_rows<T>(
     Ok(rows)
 }
 
-fn with_extra(base: &[Value], extra: impl IntoIterator<Item = Value>) -> Vec<Value> {
+pub(crate) fn with_extra(base: &[Value], extra: impl IntoIterator<Item = Value>) -> Vec<Value> {
     let mut all = base.to_vec();
     all.extend(extra);
     all
@@ -197,6 +198,8 @@ async fn calendar(
         Some(_) => return Err(ApiError::bad_request("granularity debe ser month o day")),
     };
     let unit = if by_day { "day" } else { "month" };
+    // Que la serie con ceros respete year/month/day (si no, rellenaría los periodos excluidos).
+    let period = filter.period_sql("s.p", by_day)?;
 
     let query = format!(
         "WITH daily AS ({daily}), \
@@ -205,12 +208,14 @@ async fn calendar(
          {bounds}, {series} \
          SELECT year(s.p)::BIGINT, month(s.p)::BIGINT, day(s.p)::BIGINT, coalesce(a.n, 0)::BIGINT, \
                 a.max_frp::DOUBLE, coalesce(a.active_days, 0)::BIGINT \
-         FROM series s LEFT JOIN agg a ON a.p = s.p ORDER BY s.p",
+         FROM series s LEFT JOIN agg a ON a.p = s.p {period} ORDER BY s.p",
         daily = daily_sql(&sql, &metric),
         bounds = bounds_cte(unit),
         series = series_cte(unit),
+        period = period.clause,
     );
-    let params = with_extra(&sql.params, [opt_text(&sql.from), opt_text(&sql.to)]);
+    let mut params = with_extra(&sql.params, [opt_text(&sql.from), opt_text(&sql.to)]);
+    params.extend(period.params);
 
     let items = state
         .run_db(move |conn| {
@@ -271,11 +276,12 @@ async fn climatology(
     Query(mp): Query<MetricParams>,
 ) -> Result<Json<ClimatologyResponse>, ApiError> {
     let (sql, metric) = parse_common(&state, &filter, &mp)?;
+    let period = filter.period_sql("s.p", false)?;
     let query = format!(
         "WITH daily AS ({daily}), \
          agg AS (SELECT date_trunc('month', d)::DATE AS p, sum(n)::BIGINT AS n FROM daily GROUP BY 1), \
          {bounds}, {series}, \
-         monthly AS (SELECT s.p AS p, coalesce(a.n, 0)::BIGINT AS n FROM series s LEFT JOIN agg a ON a.p = s.p) \
+         monthly AS (SELECT s.p AS p, coalesce(a.n, 0)::BIGINT AS n FROM series s LEFT JOIN agg a ON a.p = s.p {period}) \
          SELECT month(p)::BIGINT, count(*)::BIGINT, median(n)::DOUBLE, avg(n)::DOUBLE, \
                 stddev_samp(n)::DOUBLE, min(n)::BIGINT, max(n)::BIGINT, \
                 quantile_cont(n, 0.25)::DOUBLE, quantile_cont(n, 0.75)::DOUBLE, \
@@ -284,8 +290,10 @@ async fn climatology(
         daily = daily_sql(&sql, &metric),
         bounds = bounds_cte("month"),
         series = series_cte("month"),
+        period = period.clause,
     );
-    let params = with_extra(&sql.params, [opt_text(&sql.from), opt_text(&sql.to)]);
+    let mut params = with_extra(&sql.params, [opt_text(&sql.from), opt_text(&sql.to)]);
+    params.extend(period.params);
 
     let months = state
         .run_db(move |conn| {
@@ -312,243 +320,6 @@ async fn climatology(
         from: sql.from,
         to: sql.to,
         months,
-    }))
-}
-
-// ---------------------------------------------------------------- /stats/anomaly
-
-#[derive(Debug, Default, Deserialize)]
-pub struct AnomalyParams {
-    /// Año a evaluar. Por defecto el actual.
-    pub year: Option<i64>,
-    /// Mes a evaluar (1..12). Por defecto el actual.
-    pub month: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct YearValue {
-    pub year: i64,
-    pub count: i64,
-    pub max_frp: Option<f64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Baseline {
-    /// Años anteriores usados como referencia.
-    pub years: usize,
-    pub first_year: Option<i64>,
-    pub last_year: Option<i64>,
-    pub median: Option<f64>,
-    pub mean: Option<f64>,
-    pub stddev: Option<f64>,
-    pub min: Option<i64>,
-    pub max: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Anomaly {
-    /// count - mediana
-    pub vs_median: Option<f64>,
-    /// (count - mediana) / mediana * 100. Null si la mediana es 0.
-    pub vs_median_pct: Option<f64>,
-    /// count - promedio
-    pub vs_mean: Option<f64>,
-    /// (count - promedio) / desviación estándar. Null si no hay variación.
-    pub z_score: Option<f64>,
-    /// much_below | below | normal | above | much_above | no_baseline
-    pub category: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AnomalyResponse {
-    pub metric: &'static str,
-    pub cell_deg: Option<f64>,
-    pub year: i64,
-    pub month: i64,
-    /// true si el mes evaluado es el actual: se compara solo hasta el mismo día del mes.
-    pub partial_month: bool,
-    /// Días del mes comparados (del 1 a este día) cuando es parcial.
-    pub compared_days: Option<i64>,
-    pub count: i64,
-    pub max_frp: Option<f64>,
-    /// 1 = el año con más actividad para ese mes (entre la referencia y el evaluado).
-    pub rank: usize,
-    pub baseline: Baseline,
-    pub anomaly: Anomaly,
-    /// Valor del mismo mes en cada año, para graficar.
-    pub history: Vec<YearValue>,
-}
-
-fn median(sorted: &[f64]) -> Option<f64> {
-    let n = sorted.len();
-    if n == 0 {
-        None
-    } else if n % 2 == 1 {
-        Some(sorted[n / 2])
-    } else {
-        Some((sorted[n / 2 - 1] + sorted[n / 2]) / 2.0)
-    }
-}
-
-fn categorize(
-    count: f64,
-    median: Option<f64>,
-    mean: Option<f64>,
-    std: Option<f64>,
-) -> &'static str {
-    match (mean, std) {
-        (Some(m), Some(s)) if s > 0.0 => {
-            let z = (count - m) / s;
-            if z >= 2.0 {
-                "much_above"
-            } else if z >= 1.0 {
-                "above"
-            } else if z <= -2.0 {
-                "much_below"
-            } else if z <= -1.0 {
-                "below"
-            } else {
-                "normal"
-            }
-        }
-        _ => match median {
-            None => "no_baseline",
-            Some(md) if count > md => "above",
-            Some(md) if count < md => "below",
-            Some(_) => "normal",
-        },
-    }
-}
-
-async fn anomaly(
-    State(state): State<AppState>,
-    Query(filter): Query<DetectionFilter>,
-    Query(mp): Query<MetricParams>,
-    Query(ap): Query<AnomalyParams>,
-) -> Result<Json<AnomalyResponse>, ApiError> {
-    let (sql, metric) = parse_common(&state, &filter, &mp)?;
-    if let Some(m) = ap.month {
-        if !(1..=12).contains(&m) {
-            return Err(ApiError::bad_request("month debe estar entre 1 y 12"));
-        }
-    }
-    if let Some(y) = ap.year {
-        if !(1900..=2100).contains(&y) {
-            return Err(ApiError::bad_request("year debe estar entre 1900 y 2100"));
-        }
-    }
-
-    let daily = daily_sql(&sql, &metric);
-    let base_params = sql.params.clone();
-
-    let (target_year, target_month, partial, compared_days, history) = state
-        .run_db(move |conn| {
-            let (cy, cm, cd): (i64, i64, i64) = conn.query_row(
-                "SELECT year(current_date)::BIGINT, month(current_date)::BIGINT, day(current_date)::BIGINT",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            let ty = ap.year.unwrap_or(cy);
-            let tm = ap.month.unwrap_or(cm);
-            if (ty, tm) > (cy, cm) {
-                return Err(ApiError::unprocessable("el mes a evaluar está en el futuro"));
-            }
-            let partial = ty == cy && tm == cm;
-            let up_to_day = if partial { cd } else { 31 };
-
-            let query = format!(
-                "WITH daily AS ({daily}), \
-                 start_year AS (SELECT year(min(d))::BIGINT AS fy FROM daily), \
-                 vals AS (SELECT year(d)::BIGINT AS y, sum(n)::BIGINT AS n, max(max_frp)::DOUBLE AS mf \
-                          FROM daily WHERE month(d) = ? AND day(d) <= ? GROUP BY 1), \
-                 years AS (SELECT unnest(range(fy, CAST(? AS BIGINT) + 1)) AS y \
-                           FROM start_year WHERE fy IS NOT NULL AND fy <= CAST(? AS BIGINT)) \
-                 SELECT years.y::BIGINT, coalesce(vals.n, 0)::BIGINT, vals.mf \
-                 FROM years LEFT JOIN vals ON vals.y = years.y ORDER BY 1"
-            );
-            let params = with_extra(
-                &base_params,
-                [
-                    Value::BigInt(tm),
-                    Value::BigInt(up_to_day),
-                    Value::BigInt(ty),
-                    Value::BigInt(ty),
-                ],
-            );
-            let history = query_rows(conn, &query, &params, |r| {
-                Ok(YearValue {
-                    year: r.get(0)?,
-                    count: r.get(1)?,
-                    max_frp: r.get(2)?,
-                })
-            })?;
-            Ok((ty, tm, partial, if partial { Some(cd) } else { None }, history))
-        })
-        .await?;
-
-    let Some(target) = history.iter().find(|h| h.year == target_year) else {
-        return Err(ApiError::unprocessable(
-            "no hay datos en esta área para ese periodo (el mes es anterior al primer registro)",
-        ));
-    };
-
-    let previous: Vec<&YearValue> = history.iter().filter(|h| h.year < target_year).collect();
-    let mut values: Vec<f64> = previous.iter().map(|h| h.count as f64).collect();
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = values.len();
-    let med = median(&values);
-    let mean = if n > 0 {
-        Some(values.iter().sum::<f64>() / n as f64)
-    } else {
-        None
-    };
-    let std = match (mean, n) {
-        (Some(m), n) if n > 1 => {
-            Some((values.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (n as f64 - 1.0)).sqrt())
-        }
-        _ => None,
-    };
-    let count = target.count as f64;
-    let rank = 1 + history
-        .iter()
-        .filter(|h| h.year <= target_year && h.count > target.count)
-        .count();
-
-    let anomaly = Anomaly {
-        vs_median: med.map(|m| count - m),
-        vs_median_pct: med.filter(|m| *m > 0.0).map(|m| (count - m) / m * 100.0),
-        vs_mean: mean.map(|m| count - m),
-        z_score: match (mean, std) {
-            (Some(m), Some(s)) if s > 0.0 => Some((count - m) / s),
-            _ => None,
-        },
-        category: categorize(count, med, mean, std),
-    };
-    let baseline = Baseline {
-        years: n,
-        first_year: previous.first().map(|h| h.year),
-        last_year: previous.last().map(|h| h.year),
-        median: med,
-        mean,
-        stddev: std,
-        min: previous.iter().map(|h| h.count).min(),
-        max: previous.iter().map(|h| h.count).max(),
-    };
-    let (count, max_frp) = (target.count, target.max_frp);
-
-    Ok(Json(AnomalyResponse {
-        metric: metric.name(),
-        cell_deg: metric.cell_deg(),
-        year: target_year,
-        month: target_month,
-        partial_month: partial,
-        compared_days,
-        count,
-        max_frp,
-        rank,
-        baseline,
-        anomaly,
-        history,
     }))
 }
 
@@ -695,31 +466,5 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/stats/calendar", get(calendar))
         .route("/stats/climatology", get(climatology))
-        .route("/stats/anomaly", get(anomaly))
         .route("/stats/summary", get(summary))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mediana() {
-        assert_eq!(median(&[1.0, 2.0, 3.0]), Some(2.0));
-        assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]), Some(2.5));
-        assert_eq!(median(&[]), None);
-    }
-
-    #[test]
-    fn categorias() {
-        assert_eq!(
-            categorize(30.0, Some(10.0), Some(10.0), Some(5.0)),
-            "much_above"
-        );
-        assert_eq!(
-            categorize(10.0, Some(10.0), Some(10.0), Some(5.0)),
-            "normal"
-        );
-        assert_eq!(categorize(5.0, None, None, None), "no_baseline");
-    }
 }

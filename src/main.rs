@@ -4,6 +4,7 @@
 //! La configuración completa está en `config.rs` y en el README.
 
 mod analytics;
+mod anomalies;
 mod auth;
 mod config;
 mod db;
@@ -84,8 +85,11 @@ async fn main() {
     let protected = Router::new()
         .merge(entities::routes())
         .merge(analytics::routes())
+        .merge(anomalies::routes())
         .merge(firms::routes())
         .merge(explorer::routes())
+        // Se agrega antes que la autenticación, así queda por dentro: primero 401, luego 400.
+        .route_layer(middleware::from_fn(filters::reject_unknown_filters))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_api_key,

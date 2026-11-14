@@ -16,22 +16,45 @@ use crate::{
 ///   - `polygon` = geometría GeoJSON (Polygon o MultiPolygon)
 #[derive(Debug, Default, Deserialize)]
 pub struct DetectionFilter {
+    #[serde(alias = "filter[bbox]")]
     pub bbox: Option<String>,
+    #[serde(alias = "filter[lat]")]
     pub lat: Option<f64>,
+    #[serde(alias = "filter[lon]")]
     pub lon: Option<f64>,
+    #[serde(alias = "filter[radius_km]")]
     pub radius_km: Option<f64>,
+    #[serde(alias = "filter[polygon]")]
     pub polygon: Option<String>,
     /// YYYY-MM-DD, inclusivo
+    #[serde(alias = "filter[from]")]
     pub from: Option<String>,
     /// YYYY-MM-DD, inclusivo
+    #[serde(alias = "filter[to]")]
     pub to: Option<String>,
+    /// Un día exacto, YYYY-MM-DD
+    #[serde(alias = "filter[date]")]
+    pub date: Option<String>,
+    /// Lista separada por comas: 2023,2024
+    #[serde(alias = "filter[year]")]
+    pub year: Option<String>,
+    /// Lista separada por comas (1..12): 3,4
+    #[serde(alias = "filter[month]")]
+    pub month: Option<String>,
+    /// Lista separada por comas (1..31): 1,15
+    #[serde(alias = "filter[day]")]
+    pub day: Option<String>,
     /// Lista separada por comas: MODIS,VIIRS
+    #[serde(alias = "filter[instrument]")]
     pub instrument: Option<String>,
     /// Lista separada por comas: N,N20,Terra,Aqua
+    #[serde(alias = "filter[satellite]")]
     pub satellite: Option<String>,
     /// low | nominal | high
+    #[serde(alias = "filter[min_confidence]")]
     pub min_confidence: Option<String>,
     /// D | N
+    #[serde(alias = "filter[daynight]")]
     pub daynight: Option<String>,
 }
 
@@ -108,9 +131,47 @@ fn placeholders(n: usize) -> String {
     vec!["?"; n].join(", ")
 }
 
+/// Junta dos cláusulas `WHERE ...` (cualquiera puede estar vacía) con AND.
+pub fn join_clauses(a: &str, b: &str) -> String {
+    match (a.is_empty(), b.is_empty()) {
+        (true, _) => b.to_string(),
+        (_, true) => a.to_string(),
+        _ => format!("{a} AND {}", b.trim_start_matches("WHERE ")),
+    }
+}
+
+/// Lista de enteros separada por comas, cada uno dentro de [min, max].
+pub fn int_list(field: &str, text: Option<&str>, min: i64, max: i64) -> Result<Vec<i64>, ApiError> {
+    let Some(text) = text else {
+        return Ok(Vec::new());
+    };
+    split_list(text, false)
+        .iter()
+        .map(|p| match p.parse::<i64>() {
+            Ok(n) if (min..=max).contains(&n) => Ok(n),
+            _ => Err(ApiError::bad_request(format!(
+                "{field} debe ser una lista de enteros entre {min} y {max} separada por comas"
+            ))),
+        })
+        .collect()
+}
+
 impl DetectionFilter {
-    /// Convierte los parámetros en una condición SQL con sus valores.
+    /// Convierte todos los parámetros (área, atributos y tiempo) en una condición SQL
+    /// sobre `detections_harmonized`.
     pub fn to_sql(&self, spatial_available: bool) -> Result<SqlFilter, ApiError> {
+        let mut sql = self.to_sql_without_time(spatial_available)?;
+        let time = self.time_sql("acq_date", true)?;
+        sql.clause = join_clauses(&sql.clause, &time.clause);
+        sql.params.extend(time.params);
+        sql.from = time.from;
+        sql.to = time.to;
+        Ok(sql)
+    }
+
+    /// Solo área y atributos (instrumento, satélite, confianza, día/noche), sin filtros de
+    /// tiempo. Lo usan los cálculos que necesitan la historia completa como referencia.
+    pub fn to_sql_without_time(&self, spatial_available: bool) -> Result<SqlFilter, ApiError> {
         let mut conds: Vec<String> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
 
@@ -195,33 +256,6 @@ impl DetectionFilter {
             params.push(Value::Text(poly.clone()));
         }
 
-        // ---- Fechas
-        let from = self
-            .from
-            .as_deref()
-            .map(|d| date("from", d))
-            .transpose()
-            .map_err(ApiError::bad_request)?;
-        let to = self
-            .to
-            .as_deref()
-            .map(|d| date("to", d))
-            .transpose()
-            .map_err(ApiError::bad_request)?;
-        if let (Some(f), Some(t)) = (&from, &to) {
-            if f > t {
-                return Err(ApiError::bad_request("from no puede ser posterior a to"));
-            }
-        }
-        if let Some(f) = &from {
-            conds.push("acq_date >= CAST(? AS DATE)".into());
-            params.push(Value::Text(f.clone()));
-        }
-        if let Some(t) = &to {
-            conds.push("acq_date <= CAST(? AS DATE)".into());
-            params.push(Value::Text(t.clone()));
-        }
-
         // ---- Instrumento y satélite
         if let Some(list) = self
             .instrument
@@ -286,10 +320,155 @@ impl DetectionFilter {
         Ok(SqlFilter {
             clause,
             params,
+            from: None,
+            to: None,
+        })
+    }
+
+    /// Filtros de tiempo (`from`, `to`, `date`, `year`, `month`, `day`) sobre la columna de
+    /// fecha `col`. Con `include_day = false` se ignoran `date` y `day` (series por mes).
+    pub fn time_sql(&self, col: &str, include_day: bool) -> Result<SqlFilter, ApiError> {
+        self.time_sql_with(col, include_day, true)
+    }
+
+    /// Como [`Self::time_sql`] pero sin `from`/`to`: para series que ya están acotadas por
+    /// esas fechas y cuyos periodos empiezan el día 1 (un `from` a mitad de mes los excluiría).
+    pub fn period_sql(&self, col: &str, include_day: bool) -> Result<SqlFilter, ApiError> {
+        self.time_sql_with(col, include_day, false)
+    }
+
+    fn time_sql_with(
+        &self,
+        col: &str,
+        include_day: bool,
+        include_range: bool,
+    ) -> Result<SqlFilter, ApiError> {
+        let mut conds: Vec<String> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+
+        // ---- Fechas
+        let from = self
+            .from
+            .as_deref()
+            .map(|d| date("from", d))
+            .transpose()
+            .map_err(ApiError::bad_request)?;
+        let to = self
+            .to
+            .as_deref()
+            .map(|d| date("to", d))
+            .transpose()
+            .map_err(ApiError::bad_request)?;
+        if let (Some(f), Some(t)) = (&from, &to) {
+            if f > t {
+                return Err(ApiError::bad_request("from no puede ser posterior a to"));
+            }
+        }
+        if let (true, Some(f)) = (include_range, &from) {
+            conds.push(format!("{col} >= CAST(? AS DATE)"));
+            params.push(Value::Text(f.clone()));
+        }
+        if let (true, Some(t)) = (include_range, &to) {
+            conds.push(format!("{col} <= CAST(? AS DATE)"));
+            params.push(Value::Text(t.clone()));
+        }
+
+        let years = int_list("year", self.year.as_deref(), 1900, 2100)?;
+        if !years.is_empty() {
+            conds.push(format!("year({col}) IN ({})", placeholders(years.len())));
+            params.extend(years.into_iter().map(Value::BigInt));
+        }
+        let months = int_list("month", self.month.as_deref(), 1, 12)?;
+        if !months.is_empty() {
+            conds.push(format!("month({col}) IN ({})", placeholders(months.len())));
+            params.extend(months.into_iter().map(Value::BigInt));
+        }
+        if include_day {
+            let days = int_list("day", self.day.as_deref(), 1, 31)?;
+            if !days.is_empty() {
+                conds.push(format!("day({col}) IN ({})", placeholders(days.len())));
+                params.extend(days.into_iter().map(Value::BigInt));
+            }
+            if let Some(d) = self.date.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let d = date("date", d).map_err(ApiError::bad_request)?;
+                conds.push(format!("{col} = CAST(? AS DATE)"));
+                params.push(Value::Text(d));
+            }
+        }
+
+        let clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conds.join(" AND "))
+        };
+        Ok(SqlFilter {
+            clause,
+            params,
             from,
             to,
         })
     }
+}
+
+/// Filtros aceptados con la sintaxis `filter[nombre]=valor` (estilo spatie/laravel-query-builder).
+/// Cada uno es también un parámetro plano equivalente (`nombre=valor`).
+pub const ALLOWED_FILTERS: &[&str] = &[
+    "bbox",
+    "lat",
+    "lon",
+    "radius_km",
+    "polygon",
+    "from",
+    "to",
+    "date",
+    "year",
+    "month",
+    "day",
+    "instrument",
+    "satellite",
+    "min_confidence",
+    "daynight",
+    "min_score",
+    "severity",
+];
+
+/// Middleware: rechaza con 400 cualquier `filter[...]` que no esté en [`ALLOWED_FILTERS`],
+/// en vez de ignorarlo en silencio.
+pub async fn reject_unknown_filters(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::{extract::Query, response::IntoResponse};
+
+    let pairs = Query::<Vec<(String, String)>>::try_from_uri(req.uri())
+        .map(|Query(p)| p)
+        .unwrap_or_default();
+    let mut seen: Vec<&str> = Vec::new();
+    for (key, _) in &pairs {
+        // `month=3&filter[month]=4` (o la misma clave dos veces) es ambiguo: error JSON claro
+        // en vez del texto plano de axum ("duplicate field").
+        let plain = key
+            .strip_prefix("filter[")
+            .and_then(|k| k.strip_suffix(']'))
+            .unwrap_or(key);
+        if seen.contains(&plain) {
+            return ApiError::bad_request(format!("{plain} está repetido en la query"))
+                .into_response();
+        }
+        seen.push(plain);
+        if let Some(name) = key.strip_prefix("filter[").and_then(|k| k.strip_suffix(']')) {
+            if !ALLOWED_FILTERS.contains(&name) {
+                return ApiError::bad_request(format!(
+                    "filtro desconocido: {name}. Permitidos: {}",
+                    ALLOWED_FILTERS.join(", ")
+                ))
+                .into_response();
+            }
+        } else if key.starts_with("filter[") {
+            return ApiError::bad_request(format!("filtro mal formado: {key}")).into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// Valor de fecha opcional como parámetro SQL (NULL si no hay).
@@ -330,5 +509,40 @@ mod tests {
             ..Default::default()
         };
         assert!(f.to_sql(false).is_err());
+    }
+    #[test]
+    fn filtros_de_tiempo() {
+        let f = DetectionFilter {
+            year: Some("2023, 2024".into()),
+            month: Some("3".into()),
+            day: Some("14".into()),
+            date: Some("2024-03-14".into()),
+            ..Default::default()
+        };
+        let sql = f.to_sql(false).unwrap();
+        assert_eq!(sql.clause.matches('?').count(), sql.params.len());
+        assert!(sql.clause.contains("year(acq_date) IN (?, ?)"));
+
+        let monthly = f.period_sql("p", false).unwrap();
+        assert!(!monthly.clause.contains("day("));
+        assert!(DetectionFilter {
+            month: Some("13".into()),
+            ..Default::default()
+        }
+        .to_sql(false)
+        .is_err());
+    }
+
+    #[test]
+    fn sin_tiempo_y_union() {
+        let f = DetectionFilter {
+            bbox: Some("-90,13,-87,14".into()),
+            year: Some("2024".into()),
+            ..Default::default()
+        };
+        let base = f.to_sql_without_time(false).unwrap();
+        assert!(!base.clause.contains("year("));
+        assert_eq!(join_clauses("", "WHERE a"), "WHERE a");
+        assert_eq!(join_clauses("WHERE a", "WHERE b"), "WHERE a AND b");
     }
 }

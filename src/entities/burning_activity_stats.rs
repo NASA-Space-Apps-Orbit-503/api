@@ -17,7 +17,7 @@ use super::crud::{self, Entity, Page, PageParams};
 use crate::{
     analytics::{daily_sql, MetricParams},
     error::ApiError,
-    filters::DetectionFilter,
+    filters::{int_list, DetectionFilter},
     state::AppState,
     validation::{optional_min, valid_ymd},
 };
@@ -97,11 +97,18 @@ const COLUMNS: &str = "id, \"day\", \"month\", \"year\", \"count\", max_frp";
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ListParams {
-    pub year: Option<i32>,
-    pub month: Option<i32>,
+    /// Lista separada por comas: 2023,2024
+    #[serde(alias = "filter[year]")]
+    pub year: Option<String>,
+    /// Lista separada por comas (1..12)
+    #[serde(alias = "filter[month]")]
+    pub month: Option<String>,
+    /// Lista separada por comas (1..31)
+    #[serde(alias = "filter[day]")]
+    pub day: Option<String>,
 }
 
-/// GET /burning-activity-stats?year=&month=&limit=&offset=
+/// GET /burning-activity-stats?year=&month=&day=&limit=&offset=
 async fn list(
     State(state): State<AppState>,
     Query(lp): Query<ListParams>,
@@ -109,13 +116,16 @@ async fn list(
 ) -> Result<Json<Page<BurningActivityStat>>, ApiError> {
     let mut conds = Vec::new();
     let mut params = Vec::new();
-    if let Some(y) = lp.year {
-        conds.push("\"year\" = ?");
-        params.push(Value::Int(y));
-    }
-    if let Some(m) = lp.month {
-        conds.push("\"month\" = ?");
-        params.push(Value::Int(m));
+    for (column, field, text, min, max) in [
+        ("\"year\"", "year", &lp.year, 1900, 2100),
+        ("\"month\"", "month", &lp.month, 1, 12),
+        ("\"day\"", "day", &lp.day, 1, 31),
+    ] {
+        let values = int_list(field, text.as_deref(), min, max)?;
+        if !values.is_empty() {
+            conds.push(format!("{column} IN ({})", vec!["?"; values.len()].join(", ")));
+            params.extend(values.into_iter().map(Value::BigInt));
+        }
     }
     let clause = if conds.is_empty() {
         String::new()
