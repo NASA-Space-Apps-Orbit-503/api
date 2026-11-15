@@ -39,6 +39,7 @@ API HTTP en Rust para el calendario de actividad de quema (NASA Space Apps · *H
 | Calendario de actividad desde los 2000 a hoy | `GET /stats/calendar` |
 | Qué meses y años tienen más fuegos | `GET /stats/summary` y `GET /stats/climatology` |
 | Detectar anomalías por celda y día frente a la historia | `GET /stats/anomalies` |
+| Serie mensual MODIS → VIIRS armonizada (factor por mes, validación, anomalía) | `GET /stats/harmonized`, `GET /stats/harmonization` |
 | Descargar un CSV de los hotspots de la búsqueda | `GET /detections?format=csv` |
 | Datos de NASA FIRMS | `POST /detections/import`, `POST /firms/sync` y sincronización automática |
 
@@ -59,6 +60,7 @@ src/
 ├── filters.rs               # filtros de área, tiempo, instrumento, satélite, confianza; filter[...]
 ├── analytics.rs             # /stats/*: calendario, climatología, resumen
 ├── anomalies.rs             # /stats/anomalies: anomalías por celda y día
+├── harmonization.rs         # serie mensual armonizada (factor VIIRS → MODIS), recalculada al importar
 ├── firms.rs                 # lectura de CSV FIRMS, descarga y sincronización
 ├── explorer.rs              # /health, /tables, /query
 └── entities/
@@ -137,6 +139,22 @@ MODIS (Terra y Aqua, desde 2000) y VIIRS (S-NPP desde 2012, NOAA-20 y NOAA-21) n
 
 Para la serie más consistente desde 2000, se recomienda combinar MODIS (todo el periodo) con VIIRS (desde 2012) usando `metric=cells`. Si quieres revisar el efecto de cada sensor, filtra con `instrument=MODIS` o `instrument=VIIRS` y compara en el periodo en que ambos coinciden.
 
+### Serie armonizada mensual (factor VIIRS → MODIS)
+
+Cada importación que guarda filas nuevas (`POST /detections/import`, `POST /firms/sync` y la sincronización automática) recalcula sobre **todo el histórico** y guarda el resultado en `harmonized_monthly`, `harmonization_factors`, `harmonization_validation`, `harmonization_static_cells` y `harmonization_runs`. No se calcula por CSV porque el factor necesita los meses en que ambos sensores tienen datos.
+
+1. **Unificar:** solo MODIS y VIIRS con satélite reconocido (`satellite_name` de la vista: `N`, `1`, `J1`… → `Suomi NPP`, `NOAA-20`…); sin duplicados por satélite, instante y coordenadas a 4 decimales; dentro de `HARMONIZE_BBOX`; fecha local con `HARMONIZE_UTC_OFFSET`; celda de `HARMONIZE_CELL_DEG`.
+2. **Limpiar:** confianza mínima, `type = 0` (sin volcanes, fuentes estáticas ni mar) y fuera las celdas con fuego en más del `HARMONIZE_STATIC_THRESHOLD` de los meses. Este último filtro solo se aplica con al menos `HARMONIZE_STATIC_MIN_MONTHS` meses de datos: con pocos meses, toda celda con fuego parecería estática.
+3. **Satélites:** MODIS solo Aqua (pasa ~13:30, igual que VIIRS); VIIRS un satélite por día según `HARMONIZE_VIIRS_PRIORITY` (Suomi NPP hasta `HARMONIZE_SNPP_END`, luego NOAA-20).
+4. **Celdas-día:** celdas con fuego por día y sensor (días sin fuego = 0), sumadas por mes.
+5. **Factor por mes calendario** = Σ MODIS / Σ VIIRS en los meses completos de ambos sensores hasta `HARMONIZE_OVERLAP_END` (razón de sumas). Si VIIRS tiene menos de `HARMONIZE_MIN_CELLS_MONTH` celdas-día en ese mes, se usa el factor de su época (seca = `HARMONIZE_DRY_MONTHS`, lluviosa = el resto).
+6. **Serie:** MODIS Aqua antes del traslape; VIIRS × factor (equivalente MODIS) desde el primer mes de traslape, así sigue cuando MODIS se apague.
+7. **Validación** dejando fuera un año a la vez y **anomalía robusta** `(valor − mediana) / (p75 − p25)` del mismo mes en `HARMONIZE_REFERENCE_YEARS`: ≤ −1 `very_low` · ≤ −0.5 `low` · ≤ 0.5 `normal` · ≤ 1 `high` · > 1 `very_high`.
+
+`status` de la corrida: `ok`, `no_overlap` (no hay meses completos de ambos sensores; la serie es solo MODIS) o `insufficient_data` (no hay datos de Aqua MODIS). Si el traslape tiene un solo año, no hay validación por año (no queda con qué calcular el factor sin ese año).
+
+La sincronización automática recalcula una sola vez por ciclo, al final de todas las fuentes. `POST /detections` (crear a mano) **no** recalcula. Tras eso, tras cambiar `HARMONIZE_*` o tras cargar con el CLI de DuckDB, usa `POST /harmonization/rebuild`.
+
 ---
 
 ## Configuración
@@ -157,6 +175,18 @@ Para la serie más consistente desde 2000, se recomienda combinar MODIS (todo el
 | `FIRMS_SYNC_AREA`    | `-90.13,13.15,-87.68,14.45`       | Área a sincronizar (por defecto El Salvador) |
 | `FIRMS_SYNC_SOURCES` | `VIIRS_SNPP_NRT,VIIRS_NOAA20_NRT,VIIRS_NOAA21_NRT,MODIS_NRT` | Fuentes a sincronizar |
 | `FIRMS_SYNC_DAYS`    | `2`                               | Días hacia atrás en cada sincronización (1–10) |
+| `HARMONIZE_BBOX`     | el de `FIRMS_SYNC_AREA`           | Área de la serie armonizada (`none` = sin recorte). Conviene que coincida con el área de sincronización, para que los meses NRT y los del archivo cubran lo mismo |
+| `HARMONIZE_CELL_DEG` | `0.01`                            | Celda en grados (≈ 1.1 km) |
+| `HARMONIZE_MIN_CONFIDENCE` | `nominal`                   | `nominal` (nominal + high) o `high` |
+| `HARMONIZE_STATIC_THRESHOLD` | `0.30`                    | Fracción de meses con fuego para marcar una celda como fuente estática |
+| `HARMONIZE_STATIC_MIN_MONTHS` | `12`                     | Meses de datos mínimos para aplicar el filtro de fuentes estáticas |
+| `HARMONIZE_SNPP_END` | `2026-11-02`                      | Fin de Suomi NPP (desde ese día se usa el siguiente VIIRS) |
+| `HARMONIZE_VIIRS_PRIORITY` | `Suomi NPP,NOAA-20,NOAA-21` | Satélite VIIRS de referencia, en orden |
+| `HARMONIZE_OVERLAP_END` | `2025-12`                      | Último mes (YYYY-MM) usado para calcular el factor |
+| `HARMONIZE_MIN_CELLS_MONTH` | `30`                       | Menos celdas-día VIIRS en un mes → factor de la época |
+| `HARMONIZE_DRY_MONTHS` | `11,12,1,2,3,4`                 | Meses de la época seca |
+| `HARMONIZE_REFERENCE_YEARS` | `2003-2025`                | Años para la mediana de la anomalía |
+| `HARMONIZE_UTC_OFFSET` | `-6`                            | Horas de diferencia con UTC para la fecha local |
 
 Genera la API key con `openssl rand -hex 32`. Si tu base se llama distinto, cambia `DB_PATH` (por ejemplo `/data/nasa.duckdb`).
 
@@ -233,6 +263,9 @@ export SV="bbox=-90.13,13.15,-87.68,14.45"     # El Salvador
 | GET    | `/stats/anomalies`    | Anomalías por celda y día (paginado, ordenable)      |
 | GET    | `/stats/anomalies/{id}` | Una anomalía por id                                |
 | GET    | `/stats/summary`      | Totales, años y meses con más actividad              |
+| GET    | `/stats/harmonized`   | Serie mensual armonizada con anomalía (`year`, `month`, `from`, `to`, `complete`) |
+| GET    | `/stats/harmonization` | Última corrida, factores por mes y validación por año |
+| POST   | `/harmonization/rebuild` | Recalcular la armonización                        |
 | POST   | `/firms/sync`         | Descargar de FIRMS e importar                        |
 | GET    | `/health`             | Estado del servicio (siempre público)                |
 | GET    | `/tables`             | Tablas y vistas                                      |
@@ -428,6 +461,8 @@ curl -X POST "$API/detections/import" -H "x-api-key: $KEY" \
 - Funciona con CSV de MODIS y de VIIRS, columnas en cualquier orden.
 - Si alguna fila es inválida, por defecto **no guarda nada** y responde `422` con la lista de errores (`line` y `error`). Con `?skip_invalid=true` guarda las válidas.
 - Las detecciones que ya existen se cuentan como `duplicates`.
+- Se lee la columna `type` del archivo SP (0 vegetación, 1 volcán, 2 fuente estática, 3 mar). Si la detección ya existía sin `type` (vino de un CSV NRT), se completa y se cuenta en `updated`.
+- Si hubo filas nuevas o completadas, recalcula la serie armonizada y devuelve su resumen en `harmonization` (o `harmonization_error`; las filas igual quedan guardadas). Para cargar muchos CSV seguidos, usa `?harmonize=false` y al final `POST /harmonization/rebuild`.
 - Para archivos de muchos MB, divídelos en partes o usa el CLI (siguiente punto).
 
 ### 4. Cargas muy grandes con el CLI de DuckDB
