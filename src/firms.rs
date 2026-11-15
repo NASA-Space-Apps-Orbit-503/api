@@ -68,6 +68,7 @@ pub fn parse_csv(text: &str, fallback_instrument: Option<&str>) -> Result<Vec<Pa
     let c_ver = col(&["version"]);
     let c_frp = col(&["frp"]);
     let c_dn = col(&["daynight"]);
+    let c_type = col(&["type"]);
 
     // Si no viene la columna instrument: el parámetro, o se deduce por las columnas de MODIS.
     let default_instrument = fallback_instrument
@@ -131,6 +132,11 @@ pub fn parse_csv(text: &str, fallback_instrument: Option<&str>) -> Result<Vec<Pa
                 bright_ti5: number(c_ti5, "bright_ti5")?,
                 frp: number(c_frp, "frp")?,
                 daynight: text(c_dn),
+                fire_type: match number(c_type, "type")? {
+                    None => None,
+                    Some(t) if t.fract() == 0.0 => Some(t as i32),
+                    Some(t) => return Err(format!("type no es un entero: {t}")),
+                },
             };
             Detection::validate(new)
         })();
@@ -218,13 +224,15 @@ pub struct SyncResult {
     pub import: ImportResult,
 }
 
-/// Descarga una fuente de FIRMS y la importa.
+/// Descarga una fuente de FIRMS y la importa. Con `harmonize`, recalcula la armonización
+/// si hubo cambios.
 pub async fn sync_once(
     state: &AppState,
     source: &str,
     area: &str,
     days: u32,
     date_from: Option<String>,
+    harmonize: bool,
 ) -> Result<SyncResult, ApiError> {
     let source = source.trim().to_ascii_uppercase();
     if !FIRMS_SOURCES.contains(&source.as_str()) {
@@ -247,8 +255,9 @@ pub async fn sync_once(
     let csv_text = fetch_area_csv(state, &source, &area, days, date_from.as_deref()).await?;
     let parsed =
         parse_csv(&csv_text, None).map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e))?;
+    let cfg = state.cfg.clone();
     let import = state
-        .run_db(move |conn| import_parsed(conn, parsed))
+        .run_db(move |conn| import_parsed(conn, parsed, harmonize.then_some(&cfg.harmonization)))
         .await?;
 
     Ok(SyncResult {
@@ -268,7 +277,15 @@ async fn sync_handler(
     let area = req
         .area
         .unwrap_or_else(|| state.cfg.firms_sync_area.clone());
-    let result = sync_once(&state, &req.source, &area, req.days.unwrap_or(1), req.date).await?;
+    let result = sync_once(
+        &state,
+        &req.source,
+        &area,
+        req.days.unwrap_or(1),
+        req.date,
+        true,
+    )
+    .await?;
     Ok(Json(result))
 }
 
@@ -288,14 +305,41 @@ pub async fn run_scheduler(state: AppState) {
     // Esperar un poco tras el arranque.
     tokio::time::sleep(Duration::from_secs(15)).await;
     loop {
+        // Se recalcula la armonización una sola vez, al final de todas las fuentes.
+        let mut changed = 0usize;
         for source in &state.cfg.firms_sync_sources {
             let area = state.cfg.firms_sync_area.clone();
-            match sync_once(&state, source, &area, state.cfg.firms_sync_days, None).await {
-                Ok(r) => println!(
-                    "FIRMS {source}: {} filas, {} nuevas, {} repetidas, {} inválidas",
-                    r.import.received, r.import.inserted, r.import.duplicates, r.import.invalid
-                ),
+            match sync_once(
+                &state,
+                source,
+                &area,
+                state.cfg.firms_sync_days,
+                None,
+                false,
+            )
+            .await
+            {
+                Ok(r) => {
+                    changed += r.import.inserted + r.import.updated;
+                    println!(
+                        "FIRMS {source}: {} filas, {} nuevas, {} repetidas, {} inválidas",
+                        r.import.received, r.import.inserted, r.import.duplicates, r.import.invalid
+                    )
+                }
                 Err(e) => eprintln!("FIRMS {source}: error {}: {}", e.status.as_u16(), e.message),
+            }
+        }
+        if changed > 0 {
+            let cfg = state.cfg.clone();
+            match state
+                .run_db(move |conn| crate::harmonization::recompute(conn, &cfg.harmonization))
+                .await
+            {
+                Ok(run) => println!(
+                    "armonización: {} ({} detecciones usadas)",
+                    run.status, run.used
+                ),
+                Err(e) => eprintln!("armonización: error {}: {}", e.status.as_u16(), e.message),
             }
         }
         tokio::time::sleep(Duration::from_secs(hours * 3600)).await;
