@@ -19,15 +19,15 @@ use crate::{
     error::ApiError,
     filters::{date_range, DetectionFilter},
     state::AppState,
+    timestamp::ymd_ms,
     validation::{optional_min, valid_ymd},
 };
 
 #[derive(Debug, Serialize)]
 pub struct BurningActivityStat {
     pub id: i64,
-    pub day: i32,
-    pub month: i32,
-    pub year: i32,
+    /// Día de la estadística en epoch ms UTC.
+    pub date: i64,
     pub count: i64,
     pub max_frp: Option<f64>,
 }
@@ -84,9 +84,7 @@ impl Entity for BurningActivityStat {
     fn from_row(row: &Row<'_>) -> duckdb::Result<Self> {
         Ok(Self {
             id: row.get(0)?,
-            day: row.get(1)?,
-            month: row.get(2)?,
-            year: row.get(3)?,
+            date: ymd_ms(row.get(3)?, row.get(2)?, row.get(1)?),
             count: row.get(4)?,
             max_frp: row.get(5)?,
         })

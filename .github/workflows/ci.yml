@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: production
-      url: https://api-nasa.fopinet.com
+      url: https://api-nasa.fopi.cc
     steps:
       # GitHub-style push payload so Dokploy can read the branch and commit message.
       - name: Send deploy webhook

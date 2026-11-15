@@ -95,7 +95,7 @@ El esquema se crea solo al arrancar (`schema.sql` es idempotente). La primera ve
 | `bright_ti4` | número | No          | ≥ 0 (K). En MODIS es `brightness`                           |
 | `scan`       | número | No          | ≥ 0                                                         |
 | `track`      | número | No          | ≥ 0                                                         |
-| `acq_date`   | texto  | Sí          | `YYYY-MM-DD`                                                |
+| `acq_date`   | texto  | Sí          | `YYYY-MM-DD`. En las respuestas: epoch ms del momento de adquisición |
 | `acq_time`   | texto  | Sí          | Hora UTC; acepta `0412`, `412` o `04:12`, se guarda `0412`  |
 | `satellite`  | texto  | Sí          | Máx. 20 (`N`, `N20`, `N21`, `Terra`, `Aqua`…)               |
 | `instrument` | texto  | Sí          | Debe existir en `instruments.code`; se guarda en mayúsculas |
@@ -117,6 +117,8 @@ Una detección es única por **lugar + fecha + hora + satélite + instrumento**:
 | `year`    | entero | Sí          | 1900 a 2100                   |
 | `count`   | entero | Sí          | ≥ 0                           |
 | `max_frp` | número | No          | ≥ 0 (MW)                      |
+
+Al crear se envían `day`, `month` y `year`; las respuestas devuelven en su lugar `date` (epoch ms del día).
 
 La tabla guarda **una** serie diaria (un área). Se llena a mano o con `POST /burning-activity-stats/rebuild`. Para áreas que elige el usuario usa `/stats/*`, que calcula en el momento.
 
@@ -313,6 +315,20 @@ curl -H "x-api-key: $KEY" -OJ "$API/detections?$SV&startDate=2024-01-01&endDate=
 
 ---
 
+## Fechas en las respuestas
+
+Toda fecha que devuelve la API en JSON es un **timestamp en milisegundos (epoch ms, UTC)**, listo para `new Date(ms)`:
+
+| Campo | Qué representa |
+|-------|----------------|
+| `acq_date` (detecciones) | Momento de la adquisición: `acq_date` + `acq_time` (`acq_time` sigue viniendo como `HHMM`) |
+| `date` (calendario, `top_months`, anomalías, estadísticas diarias) | Inicio del periodo: el día, o el primer día del mes a las 00:00 UTC |
+| `from`, `to`, `first_date`, `last_date` | Días a las 00:00 UTC |
+| `month`, `first_month`, `overlap_end`, ... (armonización) | Primer día del mes a las 00:00 UTC |
+| `computed_at` | Momento del cálculo |
+
+Los parámetros de entrada (`startDate`, `endDate`, el `acq_date` al crear, el `date` de `/firms/sync`) siguen siendo `YYYY-MM-DD`. Los números que no son fechas, como `year` en `top_years` o el `month` 1–12 de la climatología, siguen como enteros. El CSV de `/detections?format=csv` mantiene el formato de FIRMS (`acq_date` `YYYY-MM-DD`) para poder volver a subirlo a `/detections/import`. `/tables` y `/query` devuelven las columnas tal como las entrega DuckDB.
+
 ## Filtros comunes
 
 Los aceptan `GET /detections`, todo `/stats/*` y `POST /burning-activity-stats/rebuild`.
@@ -373,10 +389,10 @@ curl -H "x-api-key: $KEY" "$API/stats/calendar?$SV&startDate=2001-01-01&endDate=
 ```json
 {
   "metric": "cells", "cell_deg": 0.01, "granularity": "month",
-  "from": "2001-01-01", "to": "2024-12-31",
+  "from": 978307200000, "to": 1735603200000,
   "items": [
-    { "year": 2001, "month": 1, "day": null, "count": 12, "max_frp": 45.1, "active_days": 6 },
-    { "year": 2001, "month": 2, "day": null, "count": 87, "max_frp": 120.4, "active_days": 19 }
+    { "date": 978307200000, "count": 12, "max_frp": 45.1, "active_days": 6 },
+    { "date": 980985600000, "count": 87, "max_frp": 120.4, "active_days": 19 }
   ]
 }
 ```
@@ -410,7 +426,7 @@ curl -H "x-api-key: $KEY" "$API/stats/anomalies?$SV&startDate=2024-03-01&endDate
 {
   "cell_deg": 0.1, "total": 42, "limit": 100, "offset": 0,
   "items": [
-    { "id": "2024-03-14_0.1_136_-893", "date": "2024-03-14",
+    { "id": "2024-03-14_0.1_136_-893", "date": 1710374400000,
       "location": { "latitude": 13.65, "longitude": -89.25, "cell_deg": 0.1 },
       "observed": 37, "expected": 1.8, "ratio": 20.6, "score": 9.28, "severity": "extreme",
       "max_frp": 88.1, "baseline_years": 23 }
@@ -442,7 +458,7 @@ curl -X POST "$API/firms/sync" -H "x-api-key: $KEY" -H "Content-Type: applicatio
 ```
 
 ```json
-{ "source": "VIIRS_SNPP_SP", "area": "-90.13,13.15,-87.68,14.45", "days": 10, "date": "2023-03-01",
+{ "source": "VIIRS_SNPP_SP", "area": "-90.13,13.15,-87.68,14.45", "days": 10, "date": 1677628800000,
   "received": 845, "valid": 845, "inserted": 845, "duplicates": 0, "invalid": 0, "errors": [] }
 ```
 

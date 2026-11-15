@@ -48,9 +48,11 @@ pub fn confidence(field: &str, value: Option<String>) -> Result<Option<String>, 
                     "high"
                 }
             }
-            _ => return Err(format!(
+            _ => {
+                return Err(format!(
                 "{field} debe ser low, nominal o high (también l/n/h o un valor MODIS de 0 a 100)"
-            )),
+            ))
+            }
         },
     };
     Ok(Some(category.to_string()))

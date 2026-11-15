@@ -29,6 +29,7 @@ use crate::{
     error::ApiError,
     filters::{join_clauses, DetectionFilter, SqlFilter},
     state::AppState,
+    timestamp::date_ms,
     validation::date,
 };
 
@@ -76,7 +77,8 @@ pub struct Location {
 pub struct AnomalyItem {
     /// `{fecha}_{cell_deg}_{fila}_{columna}`; sirve para GET /stats/anomalies/{id}.
     pub id: String,
-    pub date: String,
+    /// Día de la anomalía en epoch ms UTC.
+    pub date: i64,
     pub location: Location,
     /// Detecciones en la celda ese día.
     pub observed: i64,
@@ -218,7 +220,7 @@ fn map_item(cell: f64) -> impl FnMut(&duckdb::Row<'_>) -> duckdb::Result<Anomaly
         let expected: f64 = r.get(4)?;
         Ok(AnomalyItem {
             id: format_id(&date, cell, row, col),
-            date,
+            date: date_ms(&date).unwrap_or_default(),
             location: Location {
                 latitude: (row as f64 + 0.5) * cell,
                 longitude: (col as f64 + 0.5) * cell,
