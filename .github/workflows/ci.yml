@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REGISTRY: registry.fopi.cc
+  REGISTRY: registry.fopinet.com
   IMAGE_NAME: duck_api_nasa
 
 jobs:
