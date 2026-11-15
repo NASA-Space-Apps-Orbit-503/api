@@ -99,7 +99,7 @@ El esquema se crea solo al arrancar (`schema.sql` es idempotente). La primera ve
 | `acq_time`   | texto  | Sí          | Hora UTC; acepta `0412`, `412` o `04:12`, se guarda `0412`  |
 | `satellite`  | texto  | Sí          | Máx. 20 (`N`, `N20`, `N21`, `Terra`, `Aqua`…)               |
 | `instrument` | texto  | Sí          | Debe existir en `instruments.code`; se guarda en mayúsculas |
-| `confidence` | texto  | No          | Máx. 10 (VIIRS: `l`/`n`/`h`; MODIS: `0`–`100`)              |
+| `confidence` | texto  | No          | Se guarda como `low` / `nominal` / `high`. Acepta también VIIRS `l`/`n`/`h` y MODIS `0`–`100` (< 30 low, < 80 nominal, resto high) |
 | `version`    | texto  | No          | Máx. 20 (`2.0NRT`)                                          |
 | `bright_ti5` | número | No          | ≥ 0 (K). En MODIS es `bright_t31`                           |
 | `frp`        | número | No          | ≥ 0 (MW)                                                    |
@@ -133,7 +133,7 @@ MODIS (Terra y Aqua, desde 2000) y VIIRS (S-NPP desde 2012, NOAA-20 y NOAA-21) n
 | **Resolución:** un fuego que MODIS ve como 1 píxel de 1 km, VIIRS lo ve como varios de 375 m | `metric=cells`: se cuentan **celdas de una cuadrícula común** con al menos un hotspot por día, no puntos. La celda por defecto es `cell_deg=0.01` (≈ 1.1 km, parecida al píxel de MODIS) |
 | **Varios satélites ven el mismo fuego** | La misma celda el mismo día cuenta una sola vez, sin importar cuántos satélites la detectaron |
 | **Columnas distintas** (`brightness`/`bright_t31` vs `bright_ti4`/`bright_ti5`) | Al importar, MODIS `brightness` → `bright_ti4` y `bright_t31` → `bright_ti5` |
-| **Confianza en escalas distintas** (MODIS 0–100, VIIRS `l`/`n`/`h`) | La vista `detections_harmonized` agrega `confidence_level` (1 = low, 2 = nominal, 3 = high). Filtro `min_confidence` |
+| **Confianza en escalas distintas** (MODIS 0–100, VIIRS `l`/`n`/`h`) | Al guardar, `confidence` se convierte a `low` / `nominal` / `high` (MODIS: < 30, < 80, resto). La vista `detections_harmonized` agrega `confidence_level` (1, 2, 3) para el filtro `min_confidence` |
 
 `metric=detections` da los conteos crudos, para comparar.
 
@@ -289,7 +289,7 @@ Con un arreglo es **todo o nada**: si un elemento falla no se guarda ninguno, y 
 # Crear una detección
 curl -X POST "$API/detections" -H "x-api-key: $KEY" -H "Content-Type: application/json" \
   -d '{"latitude":13.6929,"longitude":-89.2182,"acq_date":"2024-03-14","acq_time":"0748",
-       "satellite":"N","instrument":"VIIRS","confidence":"n","frp":4.2,"daynight":"N"}'
+       "satellite":"N","instrument":"VIIRS","confidence":"nominal","frp":4.2,"daynight":"N"}'
 
 # Crear varias estadísticas: misma ruta, el cuerpo es un arreglo
 curl -X POST "$API/burning-activity-stats" -H "x-api-key: $KEY" -H "Content-Type: application/json" \
@@ -495,7 +495,7 @@ FROM read_csv('/data/fire_archive_M-C61.csv');
 docker compose start api
 ```
 
-DuckDB solo permite un proceso con escritura a la vez: por eso hay que detener la API antes.
+DuckDB solo permite un proceso con escritura a la vez: por eso hay que detener la API antes. Al volver a arrancar, la API convierte `confidence` a `low` / `nominal` / `high`; después recalcula la serie con `POST /harmonization/rebuild`.
 
 ---
 

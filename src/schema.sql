@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS detections (
     acq_time     VARCHAR NOT NULL,  -- HHMM en UTC, igual que FIRMS
     satellite    VARCHAR NOT NULL,
     instrument   VARCHAR NOT NULL REFERENCES instruments (code),
-    confidence   VARCHAR,
+    confidence   VARCHAR,           -- low | nominal | high
     "version"    VARCHAR,
     bright_ti5   DOUBLE,
     frp          DOUBLE,
@@ -42,22 +42,31 @@ CREATE INDEX IF NOT EXISTS detections_acq_date_idx ON detections (acq_date);
 CREATE UNIQUE INDEX IF NOT EXISTS detections_natural_key
     ON detections (latitude, longitude, acq_date, acq_time, satellite, instrument);
 
--- Vista armonizada: agrega la confianza normalizada a una escala común y el nombre
--- unificado del satélite (FIRMS usa distintos códigos según el archivo).
---   VIIRS: l / n / h          → 1 / 2 / 3
---   MODIS: 0-29 / 30-79 / 80+ → 1 / 2 / 3   (umbrales de la guía de usuario de FIRMS)
+-- La confianza se guarda como categoría (la API convierte al validar). Bases viejas o cargas
+-- con el CLI de DuckDB: VIIRS l / n / h y MODIS 0-29 / 30-79 / 80-100 (umbrales de la guía
+-- de FIRMS) pasan a low / nominal / high; un valor no reconocido queda en NULL.
+UPDATE detections SET confidence = CASE
+        WHEN lower(trim(confidence)) IN ('l', 'low') THEN 'low'
+        WHEN lower(trim(confidence)) IN ('n', 'nominal') THEN 'nominal'
+        WHEN lower(trim(confidence)) IN ('h', 'high') THEN 'high'
+        WHEN TRY_CAST(confidence AS DOUBLE) BETWEEN 0 AND 100 THEN CASE
+            WHEN TRY_CAST(confidence AS DOUBLE) < 30 THEN 'low'
+            WHEN TRY_CAST(confidence AS DOUBLE) < 80 THEN 'nominal'
+            ELSE 'high' END
+    END
+WHERE confidence IS NOT NULL AND confidence NOT IN ('low', 'nominal', 'high');
+
+-- Vista armonizada: agrega la confianza como número (1 low, 2 nominal, 3 high) para el
+-- filtro min_confidence y el nombre unificado del satélite (FIRMS usa distintos códigos
+-- según el archivo).
 --   satellite_name: Terra, Aqua, Suomi NPP, NOAA-20, NOAA-21 o NULL si el código no se reconoce.
 CREATE OR REPLACE VIEW detections_harmonized AS
 SELECT
     *,
-    CASE
-        WHEN lower(confidence) IN ('l', 'low') THEN 1
-        WHEN lower(confidence) IN ('n', 'nominal') THEN 2
-        WHEN lower(confidence) IN ('h', 'high') THEN 3
-        WHEN TRY_CAST(confidence AS DOUBLE) IS NULL THEN NULL
-        WHEN TRY_CAST(confidence AS DOUBLE) < 30 THEN 1
-        WHEN TRY_CAST(confidence AS DOUBLE) < 80 THEN 2
-        ELSE 3
+    CASE confidence
+        WHEN 'low' THEN 1
+        WHEN 'nominal' THEN 2
+        WHEN 'high' THEN 3
     END AS confidence_level,
     CASE regexp_replace(lower(trim(satellite)), '\.0$', '')
         WHEN 'terra' THEN 'Terra'

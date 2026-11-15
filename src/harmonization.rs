@@ -678,8 +678,8 @@ mod tests {
     fn insert(conn: &Connection, lat: f64, lon: f64, day: &str, time: &str, sat: &str, inst: &str) {
         conn.execute(
             "INSERT INTO detections (latitude, longitude, acq_date, acq_time, satellite, instrument, confidence) \
-             VALUES (?, ?, CAST(? AS DATE), ?, ?, ?, CASE WHEN ? = 'MODIS' THEN '90' ELSE 'h' END)",
-            duckdb::params![lat, lon, day, time, sat, inst, inst],
+             VALUES (?, ?, CAST(? AS DATE), ?, ?, ?, 'high')",
+            duckdb::params![lat, lon, day, time, sat, inst],
         )
         .unwrap();
     }
@@ -790,7 +790,7 @@ mod tests {
             acq_time: "1900".into(),
             satellite: "Aqua".into(),
             instrument: "MODIS".into(),
-            confidence: Some("90".into()),
+            confidence: Some("high".into()),
             version: None,
             bright_ti5: None,
             frp: None,
@@ -846,7 +846,34 @@ mod tests {
                  ON detections (latitude, longitude, acq_date, acq_time, satellite, instrument);",
         )
         .unwrap();
+        conn.execute_batch(
+            "INSERT INTO instruments (code, name) VALUES ('MODIS', 'MODIS'), ('VIIRS', 'VIIRS');
+             INSERT INTO detections (latitude, longitude, acq_date, acq_time, satellite, instrument, confidence)
+             VALUES (13.1, -89.1, DATE '2020-01-01', '1200', 'Aqua', 'MODIS', '85'),
+                    (13.2, -89.1, DATE '2020-01-01', '1200', 'Aqua', 'MODIS', '29'),
+                    (13.3, -89.1, DATE '2020-01-01', '1200', 'N', 'VIIRS', 'n'),
+                    (13.4, -89.1, DATE '2020-01-01', '1200', 'N', 'VIIRS', 'raro');",
+        )
+        .unwrap();
         conn.execute_batch(include_str!("schema.sql")).unwrap();
+        // Reaplicar el esquema no cambia nada (idempotente).
+        conn.execute_batch(include_str!("schema.sql")).unwrap();
+        let conf: Vec<(Option<String>, Option<i32>)> = query_rows(
+            &conn,
+            "SELECT confidence, confidence_level FROM detections_harmonized ORDER BY latitude",
+            &[],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+        assert_eq!(
+            conf,
+            vec![
+                (Some("high".into()), Some(3)),
+                (Some("low".into()), Some(1)),
+                (Some("nominal".into()), Some(2)),
+                (None, None),
+            ]
+        );
         let n: i64 = conn
             .query_row(
                 "SELECT count(*) FROM information_schema.columns \

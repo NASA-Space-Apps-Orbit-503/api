@@ -27,6 +27,35 @@ pub fn optional_text(
     }
 }
 
+/// Confianza de FIRMS como categoría: `low` | `nominal` | `high`.
+/// Acepta la forma de VIIRS (`l` / `n` / `h` o la palabra completa) y la de MODIS
+/// (0-100: menos de 30 low, menos de 80 nominal, el resto high; umbrales de la guía de FIRMS).
+pub fn confidence(field: &str, value: Option<String>) -> Result<Option<String>, String> {
+    let Some(v) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let category = match v.to_ascii_lowercase().as_str() {
+        "l" | "low" => "low",
+        "n" | "nominal" => "nominal",
+        "h" | "high" => "high",
+        other => match other.parse::<f64>() {
+            Ok(n) if (0.0..=100.0).contains(&n) => {
+                if n < 30.0 {
+                    "low"
+                } else if n < 80.0 {
+                    "nominal"
+                } else {
+                    "high"
+                }
+            }
+            _ => return Err(format!(
+                "{field} debe ser low, nominal o high (también l/n/h o un valor MODIS de 0 a 100)"
+            )),
+        },
+    };
+    Ok(Some(category.to_string()))
+}
+
 /// Número obligatorio dentro de [min, max].
 pub fn in_range(field: &str, value: f64, min: f64, max: f64) -> Result<(), String> {
     if value.is_finite() && value >= min && value <= max {
@@ -111,6 +140,22 @@ mod tests {
         assert!(date("d", "2024-02-29").is_ok());
         assert!(date("d", "2023-02-29").is_err());
         assert!(date("d", "2024-2-01").is_err());
+    }
+
+    #[test]
+    fn confianza_en_categorias() {
+        let c = |v: &str| confidence("confidence", Some(v.into()));
+        assert_eq!(c("n").unwrap().as_deref(), Some("nominal"));
+        assert_eq!(c(" H ").unwrap().as_deref(), Some("high"));
+        assert_eq!(c("Low").unwrap().as_deref(), Some("low"));
+        assert_eq!(c("29").unwrap().as_deref(), Some("low"));
+        assert_eq!(c("30").unwrap().as_deref(), Some("nominal"));
+        assert_eq!(c("79.5").unwrap().as_deref(), Some("nominal"));
+        assert_eq!(c("80").unwrap().as_deref(), Some("high"));
+        assert_eq!(c("").unwrap(), None);
+        assert!(c("101").is_err());
+        assert!(c("x").is_err());
+        assert_eq!(confidence("confidence", None).unwrap(), None);
     }
 
     #[test]

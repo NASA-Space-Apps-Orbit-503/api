@@ -23,7 +23,7 @@ use crate::{
     filters::DetectionFilter,
     firms, harmonization,
     state::AppState,
-    validation::{date, hhmm, in_range, optional_min, optional_text, required_text},
+    validation::{confidence, date, hhmm, in_range, optional_min, optional_text, required_text},
 };
 
 #[derive(Debug, Serialize)]
@@ -151,7 +151,7 @@ impl Entity for Detection {
         d.acq_time = hhmm("acq_time", &d.acq_time)?;
         d.satellite = required_text("satellite", &d.satellite, 20)?;
         d.instrument = required_text("instrument", &d.instrument, 20)?.to_ascii_uppercase();
-        d.confidence = optional_text("confidence", d.confidence, 10)?;
+        d.confidence = confidence("confidence", d.confidence)?;
         d.version = optional_text("version", d.version, 20)?;
 
         d.daynight = optional_text("daynight", d.daynight, 1)?.map(|v| v.to_ascii_uppercase());

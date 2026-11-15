@@ -363,6 +363,7 @@ mod tests {
         let d = rows[0].result.as_ref().unwrap();
         assert_eq!(d.acq_time, "0748");
         assert_eq!(d.instrument, "VIIRS");
+        assert_eq!(d.confidence.as_deref(), Some("nominal"));
     }
 
     #[test]
@@ -372,6 +373,7 @@ mod tests {
         assert_eq!(d.instrument, "MODIS");
         assert_eq!(d.bright_ti4, Some(310.2));
         assert_eq!(d.bright_ti5, Some(295.0));
+        assert_eq!(d.confidence.as_deref(), Some("nominal")); // 65
         assert!(rows[1].result.is_err()); // latitude 99
         assert_eq!(rows[1].line, 3);
     }
