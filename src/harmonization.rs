@@ -5,8 +5,9 @@
 //! recalcula todo y se guarda en tablas derivadas (`harmonization_*`, `harmonized_monthly`).
 //!
 //! Pasos (todos en SQL de DuckDB):
-//!   1. Detecciones MODIS/VIIRS con satélite reconocido, sin duplicados (satélite, instante y
-//!      coordenadas a 4 decimales), dentro del área, con fecha local y celda de `cell_deg`.
+//!   1. Detecciones MODIS/VIIRS con satélite reconocido, dentro del área, con fecha local y
+//!      celda de `cell_deg`. Los duplicados (satélite, instante y coordenadas a 4 decimales)
+//!      ya los quita la vista `detections_harmonized`.
 //!   2. Limpieza: confianza mínima, `type` = 0 y fuera las celdas con fuego en más del
 //!      `static_threshold` de los meses (solo si hay al menos `static_min_months` meses).
 //!   3. Satélites de la serie: MODIS solo Aqua; VIIRS un satélite por día según la prioridad
@@ -112,7 +113,7 @@ fn pipeline_sql(cfg: &HarmonizationConfig) -> String {
 
     format!(
         "
--- 1. Unificar: satélite reconocido, sin duplicados, dentro del área, fecha local y celda.
+-- 1. Unificar: satélite reconocido, dentro del área, fecha local y celda (sin duplicados: vista).
 CREATE OR REPLACE TEMP TABLE h_det AS
 SELECT sensor, sat,
        CAST(utc + to_hours({off}) AS DATE) AS d,
@@ -120,18 +121,13 @@ SELECT sensor, sat,
        floor(longitude / {c})::BIGINT AS cell_col,
        confidence_level, fire_type
 FROM (
-    SELECT * FROM (
-        SELECT id, instrument AS sensor, satellite_name AS sat, latitude, longitude,
-               confidence_level, \"type\" AS type_raw, coalesce(\"type\", 0) AS fire_type,
-               acq_date + make_time(CAST(substr(acq_time, 1, 2) AS BIGINT),
-                                    CAST(substr(acq_time, 3, 2) AS BIGINT), 0.0) AS utc
-        FROM detections_harmonized
-        WHERE instrument IN ('MODIS', 'VIIRS') AND satellite_name IS NOT NULL
-          AND length(acq_time) = 4 {bbox}
-    )
-    QUALIFY row_number() OVER (
-        PARTITION BY sat, utc, round(latitude, 4), round(longitude, 4)
-        ORDER BY (type_raw IS NULL), id) = 1
+    SELECT instrument AS sensor, satellite_name AS sat, latitude, longitude,
+           confidence_level, coalesce(\"type\", 0) AS fire_type,
+           acq_date + make_time(CAST(substr(acq_time, 1, 2) AS BIGINT),
+                                CAST(substr(acq_time, 3, 2) AS BIGINT), 0.0) AS utc
+    FROM detections_harmonized
+    WHERE instrument IN ('MODIS', 'VIIRS') AND satellite_name IS NOT NULL
+      AND length(acq_time) = 4 {bbox}
 );
 
 -- 2. Limpiar: confianza, type = 0 y fuentes estáticas.
@@ -654,6 +650,42 @@ mod tests {
             duckdb::params![lat, lon, day, time, sat, inst],
         )
         .unwrap();
+    }
+
+    /// La vista quita duplicados como el notebook (satélite, instante y coordenadas a 4
+    /// decimales). Par real de producción: IDs 40892 y 40893, a ~5 m, mismo pase de NOAA-20.
+    #[test]
+    fn vista_quita_duplicados_a_cuatro_decimales() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("schema.sql")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO detections (latitude, longitude, acq_date, acq_time, satellite, instrument, \"type\")
+             VALUES (13.71422, -89.47637, DATE '2020-04-22', '1935', 'N20', 'VIIRS', NULL),
+                    (13.71417, -89.47636, DATE '2020-04-22', '1935', 'N20', 'VIIRS', 0),
+                    -- Mismo satélite con otro código: también es la misma detección.
+                    (13.71421, -89.47638, DATE '2020-04-22', '1935', 'NOAA-20', 'VIIRS', NULL),
+                    -- Distintas: otro lugar (5.º decimal que cambia el 4.º), otra hora, otro satélite.
+                    (13.71460, -89.47637, DATE '2020-04-22', '1935', 'N20', 'VIIRS', NULL),
+                    (13.71422, -89.47637, DATE '2020-04-22', '1936', 'N20', 'VIIRS', NULL),
+                    (13.71422, -89.47637, DATE '2020-04-22', '1935', 'N', 'VIIRS', NULL);",
+        )
+        .unwrap();
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM detections_harmonized", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(total, 4);
+        // De las tres equivalentes queda la que tiene `type`.
+        let kept: (f64, Option<i32>) = conn
+            .query_row(
+                "SELECT latitude, \"type\" FROM detections_harmonized \
+                 WHERE acq_time = '1935' AND satellite_name = 'NOAA-20' AND round(latitude, 4) = 13.7142",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, (13.71417, Some(0)));
     }
 
     fn cfg() -> HarmonizationConfig {

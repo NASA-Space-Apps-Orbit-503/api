@@ -60,7 +60,12 @@ WHERE confidence IS NOT NULL AND confidence NOT IN ('low', 'nominal', 'high');
 -- filtro min_confidence y el nombre unificado del satélite (FIRMS usa distintos códigos
 -- según el archivo).
 --   satellite_name: Terra, Aqua, Suomi NPP, NOAA-20, NOAA-21 o NULL si el código no se reconoce.
+-- Además quita duplicados como el notebook: misma detección = mismo satélite, mismo instante
+-- y coordenadas iguales a 4 decimales (~11 m). Entre las repetidas queda la que tiene `type`
+-- y, si empatan, la de menor id. Así resumen, mapa, calendario, anomalías y armonización
+-- cuentan lo mismo.
 CREATE OR REPLACE VIEW detections_harmonized AS
+WITH named AS (
 SELECT
     *,
     CASE confidence
@@ -89,7 +94,13 @@ SELECT
         WHEN 'noaa-21' THEN 'NOAA-21'
         WHEN 'noaa21' THEN 'NOAA-21'
     END AS satellite_name
-FROM detections;
+FROM detections
+)
+SELECT * FROM named
+QUALIFY row_number() OVER (
+    PARTITION BY coalesce(satellite_name, satellite), acq_date, lpad(acq_time, 4, '0'),
+                 round(latitude, 4), round(longitude, 4)
+    ORDER BY ("type" IS NULL), id) = 1;
 
 -- ---------- Burning Activity Stats ----------
 CREATE SEQUENCE IF NOT EXISTS burning_activity_stats_id_seq START 1;
