@@ -4,7 +4,7 @@
 //!   POST /detections            crear una (objeto) o varias (arreglo, todo o nada)
 //!   GET  /detections/{id}       obtener una
 //!   GET  /detections            buscar con filtros (JSON paginado o CSV)
-//!   POST /detections/import     importar un CSV de FIRMS (MODIS o VIIRS)
+//!   POST /detections/import     importar un CSV de FIRMS (MODIS o VIIRS) y recalcular la armonización
 
 use axum::{
     extract::{Query, State},
@@ -18,11 +18,12 @@ use serde::{Deserialize, Serialize};
 
 use super::crud::{self, Entity, PageParams};
 use crate::{
+    config::HarmonizationConfig,
     error::ApiError,
     filters::DetectionFilter,
-    firms,
+    firms, harmonization,
     state::AppState,
-    validation::{date, hhmm, in_range, optional_min, optional_text, required_text},
+    validation::{confidence, date, hhmm, in_range, optional_min, optional_text, required_text},
 };
 
 #[derive(Debug, Serialize)]
@@ -46,6 +47,10 @@ pub struct Detection {
     pub frp: Option<f64>,
     /// "D" (día) o "N" (noche)
     pub daynight: Option<String>,
+    /// Tipo de punto caliente (solo en el archivo SP de FIRMS):
+    /// 0 vegetación, 1 volcán, 2 otra fuente estática, 3 mar.
+    #[serde(rename = "type")]
+    pub fire_type: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,25 +78,27 @@ pub struct NewDetection {
     pub frp: Option<f64>,
     #[serde(default)]
     pub daynight: Option<String>,
+    #[serde(default, rename = "type")]
+    pub fire_type: Option<i32>,
 }
 
 /// Columnas en el orden que espera `from_row`.
 macro_rules! columns {
     () => {
         "id, latitude, longitude, bright_ti4, scan, track, acq_date::VARCHAR, acq_time, \
-         satellite, instrument, confidence, \"version\", bright_ti5, frp, daynight"
+         satellite, instrument, confidence, \"version\", bright_ti5, frp, daynight, \"type\""
     };
 }
 
 macro_rules! insert_into {
     () => {
         "INSERT INTO detections (latitude, longitude, bright_ti4, scan, track, acq_date, acq_time, \
-         satellite, instrument, confidence, \"version\", bright_ti5, frp, daynight) \
-         VALUES (?, ?, ?, ?, ?, CAST(? AS DATE), ?, ?, ?, ?, ?, ?, ?, ?) "
+         satellite, instrument, confidence, \"version\", bright_ti5, frp, daynight, \"type\") \
+         VALUES (?, ?, ?, ?, ?, CAST(? AS DATE), ?, ?, ?, ?, ?, ?, ?, ?, ?) "
     };
 }
 
-/// Los 14 valores de una detección nueva, en el orden de `insert_into!`.
+/// Los 15 valores de una detección nueva, en el orden de `insert_into!`.
 macro_rules! detection_params {
     ($d:expr) => {
         params![
@@ -108,15 +115,19 @@ macro_rules! detection_params {
             $d.version,
             $d.bright_ti5,
             $d.frp,
-            $d.daynight
+            $d.daynight,
+            $d.fire_type
         ]
     };
 }
 
-/// Inserta ignorando las detecciones que ya existen (misma clave natural).
+/// Inserta ignorando las detecciones que ya existen (misma clave natural). Si la existente no
+/// tiene `type` (vino de un CSV NRT) y la nueva sí (archivo SP), se completa.
 const INSERT_IGNORE_SQL: &str = concat!(
     insert_into!(),
-    "ON CONFLICT (latitude, longitude, acq_date, acq_time, satellite, instrument) DO NOTHING"
+    "ON CONFLICT (latitude, longitude, acq_date, acq_time, satellite, instrument) \
+     DO UPDATE SET \"type\" = excluded.\"type\" \
+     WHERE detections.\"type\" IS NULL AND excluded.\"type\" IS NOT NULL"
 );
 
 impl Entity for Detection {
@@ -140,13 +151,18 @@ impl Entity for Detection {
         d.acq_time = hhmm("acq_time", &d.acq_time)?;
         d.satellite = required_text("satellite", &d.satellite, 20)?;
         d.instrument = required_text("instrument", &d.instrument, 20)?.to_ascii_uppercase();
-        d.confidence = optional_text("confidence", d.confidence, 10)?;
+        d.confidence = confidence("confidence", d.confidence)?;
         d.version = optional_text("version", d.version, 20)?;
 
         d.daynight = optional_text("daynight", d.daynight, 1)?.map(|v| v.to_ascii_uppercase());
         if let Some(dn) = &d.daynight {
             if dn != "D" && dn != "N" {
                 return Err("daynight debe ser \"D\" o \"N\"".into());
+            }
+        }
+        if let Some(t) = d.fire_type {
+            if !(0..=3).contains(&t) {
+                return Err("type debe ser 0, 1, 2 o 3".into());
             }
         }
         Ok(d)
@@ -173,6 +189,7 @@ impl Entity for Detection {
             bright_ti5: row.get(12)?,
             frp: row.get(13)?,
             daynight: row.get(14)?,
+            fire_type: row.get(15)?,
         })
     }
 }
@@ -259,7 +276,7 @@ async fn search(
     Ok(Json(page).into_response())
 }
 
-const CSV_HEADER: [&str; 15] = [
+const CSV_HEADER: [&str; 16] = [
     "id",
     "latitude",
     "longitude",
@@ -275,6 +292,7 @@ const CSV_HEADER: [&str; 15] = [
     "bright_ti5",
     "frp",
     "daynight",
+    "type",
 ];
 
 fn csv_err(e: csv::Error) -> ApiError {
@@ -302,20 +320,32 @@ pub struct ImportResult {
     pub inserted: usize,
     /// Filas válidas que ya existían (no se duplican).
     pub duplicates: usize,
+    /// Filas que ya existían sin `type` y se completaron con el del CSV (archivo SP).
+    pub updated: usize,
     /// Filas con errores (no se guardan).
     pub invalid: usize,
     /// Primeros errores encontrados (máximo 50).
     pub errors: Vec<RowError>,
+    /// Armonización recalculada tras guardar filas nuevas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harmonization: Option<harmonization::RunSummary>,
+    /// Si el recálculo falló (las filas igual quedaron guardadas).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harmonization_error: Option<String>,
 }
 
-/// Guarda detecciones ya validadas, ignorando las que ya existen.
-/// Todo en una transacción. Devuelve cuántas se insertaron.
+/// Guarda detecciones ya validadas, ignorando las que ya existen (solo se les completa `type`).
+/// Todo en una transacción. Devuelve (insertadas, existentes actualizadas).
 pub fn insert_ignoring_duplicates(
     conn: &mut Connection,
     rows: &[NewDetection],
-) -> Result<usize, ApiError> {
+) -> Result<(usize, usize), ApiError> {
     let tx = conn.transaction()?;
-    let inserted = {
+    let count = |tx: &duckdb::Transaction<'_>| -> Result<i64, ApiError> {
+        Ok(tx.query_row("SELECT count(*) FROM detections", [], |r| r.get(0))?)
+    };
+    let before = count(&tx)?;
+    let changed = {
         let mut stmt = tx.prepare(INSERT_IGNORE_SQL)?;
         let mut n = 0usize;
         for (i, d) in rows.iter().enumerate() {
@@ -325,14 +355,18 @@ pub fn insert_ignoring_duplicates(
         }
         n
     };
+    // execute() cuenta igual una inserción y una actualización: se separan con el total.
+    let inserted = (count(&tx)? - before).max(0) as usize;
     tx.commit()?;
-    Ok(inserted)
+    Ok((inserted, changed.saturating_sub(inserted)))
 }
 
 /// Valida, guarda y arma el resumen de una importación ya leída del CSV.
+/// Con `harmonize`, si hubo filas nuevas recalcula la armonización.
 pub fn import_parsed(
     conn: &mut Connection,
     parsed: Vec<firms::ParsedRow>,
+    harmonize: Option<&HarmonizationConfig>,
 ) -> Result<ImportResult, ApiError> {
     let received = parsed.len();
     let mut valid = Vec::with_capacity(received);
@@ -352,18 +386,31 @@ pub fn import_parsed(
             }
         }
     }
-    let inserted = if valid.is_empty() {
-        0
+    let (inserted, updated) = if valid.is_empty() {
+        (0, 0)
     } else {
         insert_ignoring_duplicates(conn, &valid)?
+    };
+    let (harmonization, harmonization_error) = match harmonize {
+        Some(cfg) if inserted + updated > 0 => match harmonization::recompute(conn, cfg) {
+            Ok(run) => (Some(run), None),
+            Err(e) => {
+                eprintln!("armonización: error {}: {}", e.status.as_u16(), e.message);
+                (None, Some(e.message))
+            }
+        },
+        _ => (None, None),
     };
     Ok(ImportResult {
         received,
         valid: valid.len(),
         inserted,
         duplicates: valid.len() - inserted,
+        updated,
         invalid,
         errors,
+        harmonization,
+        harmonization_error,
     })
 }
 
@@ -373,6 +420,9 @@ pub struct ImportParams {
     pub instrument: Option<String>,
     /// Si es true, guarda las filas válidas aunque haya inválidas. Por defecto false.
     pub skip_invalid: Option<bool>,
+    /// Si es false, no recalcula la armonización (útil al cargar muchos CSV seguidos;
+    /// al final, POST /stats/harmonization/rebuild). Por defecto true.
+    pub harmonize: Option<bool>,
 }
 
 /// POST /detections/import  (cuerpo: el CSV tal como lo descarga FIRMS)
@@ -417,14 +467,19 @@ async fn import(
             valid: received - invalid,
             inserted: 0,
             duplicates: 0,
+            updated: 0,
             invalid,
             errors,
+            harmonization: None,
+            harmonization_error: None,
         };
         return Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(summary)).into_response());
     }
 
+    let cfg = state.cfg.clone();
+    let harmonize = opts.harmonize.unwrap_or(true);
     let result = state
-        .run_db(move |conn| import_parsed(conn, parsed))
+        .run_db(move |conn| import_parsed(conn, parsed, harmonize.then_some(&cfg.harmonization)))
         .await?;
     Ok((StatusCode::OK, Json(result)).into_response())
 }

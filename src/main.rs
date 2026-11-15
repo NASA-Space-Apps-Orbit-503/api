@@ -13,6 +13,7 @@ mod error;
 mod explorer;
 mod filters;
 mod firms;
+mod harmonization;
 mod state;
 mod validation;
 
@@ -87,6 +88,7 @@ async fn main() {
         .merge(analytics::routes())
         .merge(anomalies::routes())
         .merge(firms::routes())
+        .merge(harmonization::routes())
         .merge(explorer::routes())
         // Se agrega antes que la autenticación, así queda por dentro: primero 401, luego 400.
         .route_layer(middleware::from_fn(filters::reject_unknown_filters))

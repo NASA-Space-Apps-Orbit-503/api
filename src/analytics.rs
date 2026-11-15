@@ -198,8 +198,6 @@ async fn calendar(
         Some(_) => return Err(ApiError::bad_request("granularity debe ser month o day")),
     };
     let unit = if by_day { "day" } else { "month" };
-    // Que la serie con ceros respete year/month/day (si no, rellenaría los periodos excluidos).
-    let period = filter.period_sql("s.p", by_day)?;
 
     let query = format!(
         "WITH daily AS ({daily}), \
@@ -208,14 +206,12 @@ async fn calendar(
          {bounds}, {series} \
          SELECT year(s.p)::BIGINT, month(s.p)::BIGINT, day(s.p)::BIGINT, coalesce(a.n, 0)::BIGINT, \
                 a.max_frp::DOUBLE, coalesce(a.active_days, 0)::BIGINT \
-         FROM series s LEFT JOIN agg a ON a.p = s.p {period} ORDER BY s.p",
+         FROM series s LEFT JOIN agg a ON a.p = s.p ORDER BY s.p",
         daily = daily_sql(&sql, &metric),
         bounds = bounds_cte(unit),
         series = series_cte(unit),
-        period = period.clause,
     );
-    let mut params = with_extra(&sql.params, [opt_text(&sql.from), opt_text(&sql.to)]);
-    params.extend(period.params);
+    let params = with_extra(&sql.params, [opt_text(&sql.from), opt_text(&sql.to)]);
 
     let items = state
         .run_db(move |conn| {
@@ -276,12 +272,11 @@ async fn climatology(
     Query(mp): Query<MetricParams>,
 ) -> Result<Json<ClimatologyResponse>, ApiError> {
     let (sql, metric) = parse_common(&state, &filter, &mp)?;
-    let period = filter.period_sql("s.p", false)?;
     let query = format!(
         "WITH daily AS ({daily}), \
          agg AS (SELECT date_trunc('month', d)::DATE AS p, sum(n)::BIGINT AS n FROM daily GROUP BY 1), \
          {bounds}, {series}, \
-         monthly AS (SELECT s.p AS p, coalesce(a.n, 0)::BIGINT AS n FROM series s LEFT JOIN agg a ON a.p = s.p {period}) \
+         monthly AS (SELECT s.p AS p, coalesce(a.n, 0)::BIGINT AS n FROM series s LEFT JOIN agg a ON a.p = s.p) \
          SELECT month(p)::BIGINT, count(*)::BIGINT, median(n)::DOUBLE, avg(n)::DOUBLE, \
                 stddev_samp(n)::DOUBLE, min(n)::BIGINT, max(n)::BIGINT, \
                 quantile_cont(n, 0.25)::DOUBLE, quantile_cont(n, 0.75)::DOUBLE, \
@@ -290,10 +285,8 @@ async fn climatology(
         daily = daily_sql(&sql, &metric),
         bounds = bounds_cte("month"),
         series = series_cte("month"),
-        period = period.clause,
     );
-    let mut params = with_extra(&sql.params, [opt_text(&sql.from), opt_text(&sql.to)]);
-    params.extend(period.params);
+    let params = with_extra(&sql.params, [opt_text(&sql.from), opt_text(&sql.to)]);
 
     let months = state
         .run_db(move |conn| {

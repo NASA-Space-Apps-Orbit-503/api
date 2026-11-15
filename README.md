@@ -35,10 +35,11 @@ API HTTP en Rust para el calendario de actividad de quema (NASA Space Apps · *H
 |---|---|
 | Armonizar MODIS y VIIRS en una serie consistente | `metric=cells` en todo `/stats/*` y vista `detections_harmonized` |
 | Elegir un área (dibujarla o con latitud y longitud) | Filtros `bbox`, `lat`+`lon`+`radius_km` o `polygon` (GeoJSON) |
-| Elegir un rango de fechas | Filtros `from` y `to` |
+| Elegir un rango de fechas | Filtros `startDate` y `endDate` (las dos juntas) |
 | Calendario de actividad desde los 2000 a hoy | `GET /stats/calendar` |
 | Qué meses y años tienen más fuegos | `GET /stats/summary` y `GET /stats/climatology` |
 | Detectar anomalías por celda y día frente a la historia | `GET /stats/anomalies` |
+| Serie mensual armonizada VIIRS → MODIS (factor por mes, validación, anomalía) | `GET /stats/harmonized`, `GET /stats/harmonization` |
 | Descargar un CSV de los hotspots de la búsqueda | `GET /detections?format=csv` |
 | Datos de NASA FIRMS | `POST /detections/import`, `POST /firms/sync` y sincronización automática |
 
@@ -59,6 +60,7 @@ src/
 ├── filters.rs               # filtros de área, tiempo, instrumento, satélite, confianza; filter[...]
 ├── analytics.rs             # /stats/*: calendario, climatología, resumen
 ├── anomalies.rs             # /stats/anomalies: anomalías por celda y día
+├── harmonization.rs         # serie mensual armonizada (factor VIIRS → MODIS), recalculada al importar
 ├── firms.rs                 # lectura de CSV FIRMS, descarga y sincronización
 ├── explorer.rs              # /health, /tables, /query
 └── entities/
@@ -97,7 +99,7 @@ El esquema se crea solo al arrancar (`schema.sql` es idempotente). La primera ve
 | `acq_time`   | texto  | Sí          | Hora UTC; acepta `0412`, `412` o `04:12`, se guarda `0412`  |
 | `satellite`  | texto  | Sí          | Máx. 20 (`N`, `N20`, `N21`, `Terra`, `Aqua`…)               |
 | `instrument` | texto  | Sí          | Debe existir en `instruments.code`; se guarda en mayúsculas |
-| `confidence` | texto  | No          | Máx. 10 (VIIRS: `l`/`n`/`h`; MODIS: `0`–`100`)              |
+| `confidence` | texto  | No          | Se guarda como `low` / `nominal` / `high`. Acepta también VIIRS `l`/`n`/`h` y MODIS `0`–`100` (< 30 low, < 80 nominal, resto high) |
 | `version`    | texto  | No          | Máx. 20 (`2.0NRT`)                                          |
 | `bright_ti5` | número | No          | ≥ 0 (K). En MODIS es `bright_t31`                           |
 | `frp`        | número | No          | ≥ 0 (MW)                                                    |
@@ -131,11 +133,27 @@ MODIS (Terra y Aqua, desde 2000) y VIIRS (S-NPP desde 2012, NOAA-20 y NOAA-21) n
 | **Resolución:** un fuego que MODIS ve como 1 píxel de 1 km, VIIRS lo ve como varios de 375 m | `metric=cells`: se cuentan **celdas de una cuadrícula común** con al menos un hotspot por día, no puntos. La celda por defecto es `cell_deg=0.01` (≈ 1.1 km, parecida al píxel de MODIS) |
 | **Varios satélites ven el mismo fuego** | La misma celda el mismo día cuenta una sola vez, sin importar cuántos satélites la detectaron |
 | **Columnas distintas** (`brightness`/`bright_t31` vs `bright_ti4`/`bright_ti5`) | Al importar, MODIS `brightness` → `bright_ti4` y `bright_t31` → `bright_ti5` |
-| **Confianza en escalas distintas** (MODIS 0–100, VIIRS `l`/`n`/`h`) | La vista `detections_harmonized` agrega `confidence_level` (1 = low, 2 = nominal, 3 = high). Filtro `min_confidence` |
+| **Confianza en escalas distintas** (MODIS 0–100, VIIRS `l`/`n`/`h`) | Al guardar, `confidence` se convierte a `low` / `nominal` / `high` (MODIS: < 30, < 80, resto). La vista `detections_harmonized` agrega `confidence_level` (1, 2, 3) para el filtro `min_confidence` |
 
 `metric=detections` da los conteos crudos, para comparar.
 
 Para la serie más consistente desde 2000, se recomienda combinar MODIS (todo el periodo) con VIIRS (desde 2012) usando `metric=cells`. Si quieres revisar el efecto de cada sensor, filtra con `instrument=MODIS` o `instrument=VIIRS` y compara en el periodo en que ambos coinciden.
+
+### Serie armonizada mensual (factor VIIRS → MODIS)
+
+Cada importación que guarda filas nuevas (`POST /detections/import`, `POST /firms/sync` y la sincronización automática) recalcula sobre **todo el histórico** y guarda el resultado en `harmonized_monthly`, `harmonization_factors`, `harmonization_validation`, `harmonization_static_cells` y `harmonization_runs`. No se calcula por CSV porque el factor necesita los meses en que ambos sensores tienen datos.
+
+1. **Unificar:** solo MODIS y VIIRS con satélite reconocido (`satellite_name` de la vista: `N`, `1`, `J1`… → `Suomi NPP`, `NOAA-20`…); sin duplicados por satélite, instante y coordenadas a 4 decimales; dentro de `HARMONIZE_BBOX`; fecha local con `HARMONIZE_UTC_OFFSET`; celda de `HARMONIZE_CELL_DEG`.
+2. **Limpiar:** confianza mínima, `type = 0` (sin volcanes, fuentes estáticas ni mar) y fuera las celdas con fuego en más del `HARMONIZE_STATIC_THRESHOLD` de los meses. Este último filtro solo se aplica con al menos `HARMONIZE_STATIC_MIN_MONTHS` meses de datos: con pocos meses, toda celda con fuego parecería estática.
+3. **Satélites:** MODIS solo Aqua (pasa ~13:30, igual que VIIRS); VIIRS un satélite por día según `HARMONIZE_VIIRS_PRIORITY` (Suomi NPP hasta `HARMONIZE_SNPP_END`, luego NOAA-20).
+4. **Celdas-día:** celdas con fuego por día y sensor (días sin fuego = 0), sumadas por mes.
+5. **Factor por mes calendario** = Σ MODIS / Σ VIIRS en los meses completos de ambos sensores hasta `HARMONIZE_OVERLAP_END` (razón de sumas). Si VIIRS tiene menos de `HARMONIZE_MIN_CELLS_MONTH` celdas-día en ese mes, se usa el factor de su época (seca = `HARMONIZE_DRY_MONTHS`, lluviosa = el resto).
+6. **Serie:** MODIS Aqua antes del traslape; VIIRS × factor (equivalente MODIS) desde el primer mes de traslape, así sigue cuando MODIS se apague.
+7. **Validación** dejando fuera un año a la vez y **anomalía robusta** `(valor − mediana) / (p75 − p25)` del mismo mes en `HARMONIZE_REFERENCE_YEARS`: ≤ −1 `very_low` · ≤ −0.5 `low` · ≤ 0.5 `normal` · ≤ 1 `high` · > 1 `very_high`.
+
+`status` de la corrida: `ok`, `no_overlap` (no hay meses completos de ambos sensores; la serie es solo MODIS) o `insufficient_data` (no hay datos de Aqua MODIS). Si el traslape tiene un solo año, no hay validación por año (no queda con qué calcular el factor sin ese año).
+
+La sincronización automática recalcula una sola vez por ciclo, al final de todas las fuentes. `POST /detections` (crear a mano) **no** recalcula. Tras eso, tras cambiar `HARMONIZE_*` o tras cargar con el CLI de DuckDB, usa `POST /stats/harmonization/rebuild`.
 
 ---
 
@@ -157,6 +175,18 @@ Para la serie más consistente desde 2000, se recomienda combinar MODIS (todo el
 | `FIRMS_SYNC_AREA`    | `-90.13,13.15,-87.68,14.45`       | Área a sincronizar (por defecto El Salvador) |
 | `FIRMS_SYNC_SOURCES` | `VIIRS_SNPP_NRT,VIIRS_NOAA20_NRT,VIIRS_NOAA21_NRT,MODIS_NRT` | Fuentes a sincronizar |
 | `FIRMS_SYNC_DAYS`    | `2`                               | Días hacia atrás en cada sincronización (1–10) |
+| `HARMONIZE_BBOX`     | el de `FIRMS_SYNC_AREA`           | Área de la serie armonizada (`none` = sin recorte). Conviene que coincida con el área de sincronización, para que los meses NRT y los del archivo cubran lo mismo |
+| `HARMONIZE_CELL_DEG` | `0.01`                            | Celda en grados (≈ 1.1 km) |
+| `HARMONIZE_MIN_CONFIDENCE` | `nominal`                   | `nominal` (nominal + high) o `high` |
+| `HARMONIZE_STATIC_THRESHOLD` | `0.30`                    | Fracción de meses con fuego para marcar una celda como fuente estática |
+| `HARMONIZE_STATIC_MIN_MONTHS` | `12`                     | Meses de datos mínimos para aplicar el filtro de fuentes estáticas |
+| `HARMONIZE_SNPP_END` | `2026-11-02`                      | Fin de Suomi NPP (desde ese día se usa el siguiente VIIRS) |
+| `HARMONIZE_VIIRS_PRIORITY` | `Suomi NPP,NOAA-20,NOAA-21` | Satélite VIIRS de referencia, en orden |
+| `HARMONIZE_OVERLAP_END` | `2025-12`                      | Último mes (YYYY-MM) usado para calcular el factor |
+| `HARMONIZE_MIN_CELLS_MONTH` | `30`                       | Menos celdas-día VIIRS en un mes → factor de la época |
+| `HARMONIZE_DRY_MONTHS` | `11,12,1,2,3,4`                 | Meses de la época seca |
+| `HARMONIZE_REFERENCE_YEARS` | `2003-2025`                | Años para la mediana de la anomalía |
+| `HARMONIZE_UTC_OFFSET` | `-6`                            | Horas de diferencia con UTC para la fecha local |
 
 Genera la API key con `openssl rand -hex 32`. Si tu base se llama distinto, cambia `DB_PATH` (por ejemplo `/data/nasa.duckdb`).
 
@@ -219,7 +249,7 @@ export SV="bbox=-90.13,13.15,-87.68,14.45"     # El Salvador
 | POST   | `/detections`                      | Crear una (objeto) o varias (arreglo)           |
 | POST   | `/detections/import`               | Importar un CSV de FIRMS                        |
 | GET    | `/detections/{id}`                 | Obtener una                                     |
-| GET    | `/burning-activity-stats`          | Listar (`?year=&month=`)                        |
+| GET    | `/burning-activity-stats`          | Listar (`?startDate=&endDate=`)                 |
 | POST   | `/burning-activity-stats`          | Crear una (objeto) o varias (arreglo)           |
 | POST   | `/burning-activity-stats/rebuild`  | Recalcular desde las detecciones                |
 | GET    | `/burning-activity-stats/{id}`     | Obtener una                                     |
@@ -233,6 +263,9 @@ export SV="bbox=-90.13,13.15,-87.68,14.45"     # El Salvador
 | GET    | `/stats/anomalies`    | Anomalías por celda y día (paginado, ordenable)      |
 | GET    | `/stats/anomalies/{id}` | Una anomalía por id                                |
 | GET    | `/stats/summary`      | Totales, años y meses con más actividad              |
+| GET    | `/stats/harmonized`   | Serie mensual armonizada con anomalía (`startDate`, `endDate`, `complete`) |
+| GET    | `/stats/harmonization` | Última corrida, factores por mes y validación por año |
+| POST   | `/stats/harmonization/rebuild` | Recalcular la armonización                        |
 | POST   | `/firms/sync`         | Descargar de FIRMS e importar                        |
 | GET    | `/health`             | Estado del servicio (siempre público)                |
 | GET    | `/tables`             | Tablas y vistas                                      |
@@ -256,7 +289,7 @@ Con un arreglo es **todo o nada**: si un elemento falla no se guarda ninguno, y 
 # Crear una detección
 curl -X POST "$API/detections" -H "x-api-key: $KEY" -H "Content-Type: application/json" \
   -d '{"latitude":13.6929,"longitude":-89.2182,"acq_date":"2024-03-14","acq_time":"0748",
-       "satellite":"N","instrument":"VIIRS","confidence":"n","frp":4.2,"daynight":"N"}'
+       "satellite":"N","instrument":"VIIRS","confidence":"nominal","frp":4.2,"daynight":"N"}'
 
 # Crear varias estadísticas: misma ruta, el cuerpo es un arreglo
 curl -X POST "$API/burning-activity-stats" -H "x-api-key: $KEY" -H "Content-Type: application/json" \
@@ -272,10 +305,10 @@ curl -H "x-api-key: $KEY" "$API/instruments/1"
 
 ```bash
 # JSON paginado: {"total": 1234, "limit": 100, "offset": 0, "items": [...]}
-curl -H "x-api-key: $KEY" "$API/detections?$SV&from=2024-01-01&to=2024-04-30&min_confidence=nominal&limit=100"
+curl -H "x-api-key: $KEY" "$API/detections?$SV&startDate=2024-01-01&endDate=2024-04-30&min_confidence=nominal&limit=100"
 
 # CSV descargable con todos los hotspots de la búsqueda
-curl -H "x-api-key: $KEY" -OJ "$API/detections?$SV&from=2024-01-01&to=2024-04-30&format=csv"
+curl -H "x-api-key: $KEY" -OJ "$API/detections?$SV&startDate=2024-01-01&endDate=2024-04-30&format=csv"
 ```
 
 ---
@@ -289,22 +322,20 @@ Los aceptan `GET /detections`, todo `/stats/*` y `POST /burning-activity-stats/r
 | `bbox`           | `-90.13,13.15,-87.68,14.45`           | Rectángulo oeste,sur,este,norte |
 | `lat`, `lon`, `radius_km` | `lat=13.7&lon=-89.2&radius_km=25` | Círculo alrededor de un punto |
 | `polygon`        | `{"type":"Polygon","coordinates":[...]}` (codificado en la URL) | Área dibujada en el mapa (GeoJSON) |
-| `from`, `to`     | `2001-01-01`, `2024-12-31`            | Rango de fechas inclusivo |
-| `date`           | `2024-03-14`                          | Un día exacto |
-| `year`           | `2023,2024`                           | Uno o varios años |
-| `month`          | `3,4`                                 | Uno o varios meses (1..12) |
-| `day`            | `1,15`                                | Uno o varios días del mes (1..31) |
+| `startDate`, `endDate` | `2001-01-01`, `2024-12-31`      | Rango de fechas inclusivo (YYYY-MM-DD). **Las dos juntas o ninguna**: con una sola responde `400`. Sin fechas, todo el histórico |
 | `instrument`     | `MODIS,VIIRS`                         | Uno o varios instrumentos |
 | `satellite`      | `N,N20,Terra`                         | Uno o varios satélites |
 | `min_confidence` | `low` \| `nominal` \| `high`          | Confianza mínima armonizada |
 | `daynight`       | `D` \| `N`                            | Solo de día o de noche |
 
-El área se indica de **una sola** forma. Los filtros se combinan con AND. `GET /burning-activity-stats` acepta `year`, `month` y `day`.
+El área se indica de **una sola** forma. Los filtros se combinan con AND. `GET /burning-activity-stats` y `GET /stats/harmonized` aceptan solo `startDate` y `endDate` (en la serie armonizada, el mes de cada fecha).
+
+Los filtros viejos `from`, `to`, `date`, `year`, `month` y `day` ya no existen y responden `400` (para que nadie reciba datos sin filtrar creyendo que filtró).
 
 **Sintaxis `filter[...]`** (estilo spatie/laravel-query-builder): cada filtro también se puede mandar como `filter[nombre]=valor`. Un `filter[...]` desconocido responde `400` con la lista de permitidos, en vez de ignorarse.
 
 ```bash
-curl -H "x-api-key: $KEY" "$API/detections?filter[bbox]=-90.13,13.15,-87.68,14.45&filter[month]=3&filter[day]=14"
+curl -H "x-api-key: $KEY" "$API/detections?filter[bbox]=-90.13,13.15,-87.68,14.45&filter[startDate]=2024-03-14&filter[endDate]=2024-03-14"
 ```
 
 Para las estadísticas, además:
@@ -319,7 +350,8 @@ Desde JavaScript, un polígono dibujado (por ejemplo con Leaflet o MapLibre) se 
 ```ts
 const params = new URLSearchParams({
   polygon: JSON.stringify(feature.geometry),  // { type: "Polygon", coordinates: [...] }
-  from: "2001-01-01",
+  startDate: "2001-01-01",
+  endDate: "2024-12-31",
 });
 fetch(`${API}/stats/calendar?${params}`);
 ```
@@ -335,13 +367,13 @@ Todas se calculan en el momento para el área y filtros que pidas.
 Una fila por mes (o por día con `granularity=day`), **incluidos los meses sin actividad con `count: 0`**. Es exactamente la matriz años × meses que se pinta con la rampa de colores.
 
 ```bash
-curl -H "x-api-key: $KEY" "$API/stats/calendar?$SV&from=2001-01-01"
+curl -H "x-api-key: $KEY" "$API/stats/calendar?$SV&startDate=2001-01-01&endDate=2024-12-31"
 ```
 
 ```json
 {
   "metric": "cells", "cell_deg": 0.01, "granularity": "month",
-  "from": "2001-01-01", "to": null,
+  "from": "2001-01-01", "to": "2024-12-31",
   "items": [
     { "year": 2001, "month": 1, "day": null, "count": 12, "max_frp": 45.1, "active_days": 6 },
     { "year": 2001, "month": 2, "day": null, "count": 87, "max_frp": 120.4, "active_days": 19 }
@@ -359,7 +391,7 @@ Divide el área en celdas de `cell_deg` grados (por defecto `0.1` ≈ 11 km) y, 
 
 - `score = 2 · (√(observed + 3/8) − √(expected + 3/8))`: desviación de Poisson con la transformación de Anscombe. Se lee como un z-score y está definida aunque lo esperado sea 0.
 - `severity`: `low` ≥ 2, `moderate` ≥ 3, `high` ≥ 5, `extreme` ≥ 8 (por debajo, `normal`).
-- Los filtros de tiempo eligen **qué días** se reportan; la referencia siempre usa todos los años anteriores.
+- `startDate` y `endDate` eligen **qué días** se reportan; la referencia siempre usa todos los años anteriores.
 
 | Parámetro            | Por defecto | Descripción |
 |----------------------|-------------|-------------|
@@ -371,7 +403,7 @@ Divide el área en celdas de `cell_deg` grados (por defecto `0.1` ≈ 11 km) y, 
 | `limit`, `offset`    | `100`, `0`  | Paginación |
 
 ```bash
-curl -H "x-api-key: $KEY" "$API/stats/anomalies?$SV&year=2024&month=3&severity=high,extreme"
+curl -H "x-api-key: $KEY" "$API/stats/anomalies?$SV&startDate=2024-03-01&endDate=2024-03-31&severity=high,extreme"
 ```
 
 ```json
@@ -414,6 +446,8 @@ curl -X POST "$API/firms/sync" -H "x-api-key: $KEY" -H "Content-Type: applicatio
   "received": 845, "valid": 845, "inserted": 845, "duplicates": 0, "invalid": 0, "errors": [] }
 ```
 
+Con `"harmonize": false` no recalcula la serie armonizada (por defecto sí, si hubo cambios).
+
 Fuentes: `MODIS_NRT`, `MODIS_SP`, `VIIRS_SNPP_NRT`, `VIIRS_SNPP_SP`, `VIIRS_NOAA20_NRT`, `VIIRS_NOAA20_SP`, `VIIRS_NOAA21_NRT`. Las `_SP` (procesamiento estándar) son el archivo histórico; las `_NRT`, los datos casi en tiempo real. FIRMS limita cada petición a pocos días y a un número de transacciones por cada 10 minutos.
 
 ### 3. Importar un CSV: `POST /detections/import`
@@ -428,6 +462,8 @@ curl -X POST "$API/detections/import" -H "x-api-key: $KEY" \
 - Funciona con CSV de MODIS y de VIIRS, columnas en cualquier orden.
 - Si alguna fila es inválida, por defecto **no guarda nada** y responde `422` con la lista de errores (`line` y `error`). Con `?skip_invalid=true` guarda las válidas.
 - Las detecciones que ya existen se cuentan como `duplicates`.
+- Se lee la columna `type` del archivo SP (0 vegetación, 1 volcán, 2 fuente estática, 3 mar). Si la detección ya existía sin `type` (vino de un CSV NRT), se completa y se cuenta en `updated`.
+- Si hubo filas nuevas o completadas, recalcula la serie armonizada y devuelve su resumen en `harmonization` (o `harmonization_error`; las filas igual quedan guardadas). Para cargar muchos CSV seguidos, usa `?harmonize=false` y al final `POST /stats/harmonization/rebuild`.
 - Para archivos de muchos MB, divídelos en partes o usa el CLI (siguiente punto).
 
 ### 4. Cargas muy grandes con el CLI de DuckDB
@@ -460,7 +496,7 @@ FROM read_csv('/data/fire_archive_M-C61.csv');
 docker compose start api
 ```
 
-DuckDB solo permite un proceso con escritura a la vez: por eso hay que detener la API antes.
+DuckDB solo permite un proceso con escritura a la vez: por eso hay que detener la API antes. Al volver a arrancar, la API convierte `confidence` a `low` / `nominal` / `high`; después recalcula la serie con `POST /stats/harmonization/rebuild`.
 
 ---
 
@@ -508,17 +544,17 @@ const api = createClient<paths>({ baseUrl: import.meta.env.VITE_API_URL });
 
 // Calendario de El Salvador desde 2001
 const { data: calendar } = await api.GET("/stats/calendar", {
-  params: { query: { bbox: "-90.13,13.15,-87.68,14.45", from: "2001-01-01" } },
+  params: { query: { bbox: "-90.13,13.15,-87.68,14.45", startDate: "2001-01-01", endDate: "2024-12-31" } },
 });
 
 // Anomalías graves de marzo de 2024
 const { data: anomalies } = await api.GET("/stats/anomalies", {
-  params: { query: { bbox: "-90.13,13.15,-87.68,14.45", year: "2024", month: "3", severity: "high,extreme" } },
+  params: { query: { bbox: "-90.13,13.15,-87.68,14.45", startDate: "2024-03-01", endDate: "2024-03-31", severity: "high,extreme" } },
 });
 
 // Enlace de descarga del CSV de la búsqueda actual
 const csvUrl = `${import.meta.env.VITE_API_URL}/detections?` +
-  new URLSearchParams({ bbox: "-90.13,13.15,-87.68,14.45", from: "2024-01-01", format: "csv" });
+  new URLSearchParams({ bbox: "-90.13,13.15,-87.68,14.45", startDate: "2024-01-01", endDate: "2024-12-31", format: "csv" });
 ```
 
 Con `PUBLIC_READ=true` no hace falta mandar la API key desde el navegador. Si cambias algo en Rust, actualiza `openapi.yaml` y vuelve a generar los tipos.

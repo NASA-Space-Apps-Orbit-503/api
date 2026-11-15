@@ -17,7 +17,7 @@ use super::crud::{self, Entity, Page, PageParams};
 use crate::{
     analytics::{daily_sql, MetricParams},
     error::ApiError,
-    filters::{int_list, DetectionFilter},
+    filters::{date_range, DetectionFilter},
     state::AppState,
     validation::{optional_min, valid_ymd},
 };
@@ -97,40 +97,28 @@ const COLUMNS: &str = "id, \"day\", \"month\", \"year\", \"count\", max_frp";
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ListParams {
-    /// Lista separada por comas: 2023,2024
-    #[serde(alias = "filter[year]")]
-    pub year: Option<String>,
-    /// Lista separada por comas (1..12)
-    #[serde(alias = "filter[month]")]
-    pub month: Option<String>,
-    /// Lista separada por comas (1..31)
-    #[serde(alias = "filter[day]")]
-    pub day: Option<String>,
+    /// YYYY-MM-DD, inclusivo. Se envía junto con `endDate`.
+    #[serde(rename = "startDate", alias = "filter[startDate]")]
+    pub start_date: Option<String>,
+    /// YYYY-MM-DD, inclusivo. Se envía junto con `startDate`.
+    #[serde(rename = "endDate", alias = "filter[endDate]")]
+    pub end_date: Option<String>,
 }
 
-/// GET /burning-activity-stats?year=&month=&day=&limit=&offset=
+/// GET /burning-activity-stats?startDate=&endDate=&limit=&offset=
 async fn list(
     State(state): State<AppState>,
     Query(lp): Query<ListParams>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<BurningActivityStat>>, ApiError> {
-    let mut conds = Vec::new();
-    let mut params = Vec::new();
-    for (column, field, text, min, max) in [
-        ("\"year\"", "year", &lp.year, 1900, 2100),
-        ("\"month\"", "month", &lp.month, 1, 12),
-        ("\"day\"", "day", &lp.day, 1, 31),
-    ] {
-        let values = int_list(field, text.as_deref(), min, max)?;
-        if !values.is_empty() {
-            conds.push(format!("{column} IN ({})", vec!["?"; values.len()].join(", ")));
-            params.extend(values.into_iter().map(Value::BigInt));
-        }
-    }
-    let clause = if conds.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conds.join(" AND "))
+    let (clause, params) = match date_range(lp.start_date.as_deref(), lp.end_date.as_deref())? {
+        Some((start, end)) => (
+            "WHERE make_date(\"year\", \"month\", \"day\") \
+                 BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)"
+                .to_string(),
+            vec![Value::Text(start), Value::Text(end)],
+        ),
+        None => (String::new(), Vec::new()),
     };
     let count_sql = format!("SELECT count(*) FROM burning_activity_stats {clause}");
     let page_sql = format!(
