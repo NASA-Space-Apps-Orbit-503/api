@@ -421,7 +421,7 @@ pub struct ImportParams {
     /// Si es true, guarda las filas válidas aunque haya inválidas. Por defecto false.
     pub skip_invalid: Option<bool>,
     /// Si es false, no recalcula la armonización (útil al cargar muchos CSV seguidos;
-    /// al final, POST /harmonization/rebuild). Por defecto true.
+    /// al final, POST /stats/harmonization/rebuild). Por defecto true.
     pub harmonize: Option<bool>,
 }
 

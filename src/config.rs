@@ -15,12 +15,15 @@ pub const FIRMS_SOURCES: &[&str] = &[
     "VIIRS_NOAA21_NRT",
 ];
 
-/// Parámetros de la armonización MODIS → VIIRS (`src/harmonization.rs`).
+/// Parámetros de la armonización VIIRS → MODIS (`src/harmonization.rs`).
+/// Se serializan con los mismos formatos que el resto de la API: `bbox` como
+/// "oeste,sur,este,norte" y `overlap_end` como YYYY-MM.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HarmonizationConfig {
     /// oeste, sur, este, norte. None = sin recorte por área.
     /// Por defecto, la misma área que FIRMS_SYNC_AREA, para que los meses con datos NRT y los
     /// del archivo histórico cubran la misma zona.
+    #[serde(serialize_with = "bbox_text")]
     pub bbox: Option<[f64; 4]>,
     /// Tamaño de celda en grados (0.01 ≈ 1.1 km).
     pub cell_deg: f64,
@@ -36,6 +39,7 @@ pub struct HarmonizationConfig {
     /// Satélites VIIRS de referencia, en orden de prioridad.
     pub viirs_priority: Vec<String>,
     /// Último mes usado para calcular el factor, como YYYY-MM-01.
+    #[serde(serialize_with = "year_month")]
     pub overlap_end: String,
     /// Si un mes tiene menos celdas-día VIIRS en el traslape, usa el factor de su época.
     pub min_cells_month: f64,
@@ -45,6 +49,17 @@ pub struct HarmonizationConfig {
     pub reference_years: [i32; 2],
     /// Diferencia de la hora local con UTC, en horas (El Salvador: -6, sin horario de verano).
     pub utc_offset_hours: i32,
+}
+
+fn bbox_text<S: serde::Serializer>(b: &Option<[f64; 4]>, s: S) -> Result<S::Ok, S::Error> {
+    match b {
+        Some([w, so, e, n]) => s.serialize_str(&format!("{w},{so},{e},{n}")),
+        None => s.serialize_none(),
+    }
+}
+
+fn year_month<S: serde::Serializer>(d: &str, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(d.get(..7).unwrap_or(d))
 }
 
 impl HarmonizationConfig {

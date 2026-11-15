@@ -212,6 +212,9 @@ pub struct SyncRequest {
     /// Día inicial YYYY-MM-DD. Sin él, los días más recientes.
     #[serde(default)]
     pub date: Option<String>,
+    /// Si es false, no recalcula la armonización. Por defecto true.
+    #[serde(default)]
+    pub harmonize: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -283,7 +286,7 @@ async fn sync_handler(
         &area,
         req.days.unwrap_or(1),
         req.date,
-        true,
+        req.harmonize.unwrap_or(true),
     )
     .await?;
     Ok(Json(result))

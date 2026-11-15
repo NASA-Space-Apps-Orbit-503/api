@@ -102,9 +102,9 @@ CREATE TABLE IF NOT EXISTS burning_activity_stats (
     max_frp  DOUBLE
 );
 
--- ---------- Armonización MODIS → VIIRS (serie mensual) ----------
+-- ---------- Armonización VIIRS → MODIS (serie mensual) ----------
 -- Tablas derivadas: se borran y se recalculan enteras en cada importación
--- (o con POST /harmonization/rebuild). El método está en src/harmonization.rs.
+-- (o con POST /stats/harmonization/rebuild). El método está en src/harmonization.rs.
 CREATE SEQUENCE IF NOT EXISTS harmonization_runs_id_seq START 1;
 CREATE TABLE IF NOT EXISTS harmonization_runs (
     id                           BIGINT    PRIMARY KEY DEFAULT nextval('harmonization_runs_id_seq'),

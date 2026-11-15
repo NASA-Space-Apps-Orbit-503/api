@@ -1,4 +1,4 @@
-//! Armonización MODIS → VIIRS de la serie mensual (port del notebook "Armonización").
+//! Armonización VIIRS → MODIS de la serie mensual (port del notebook "Armonización").
 //!
 //! El factor y la anomalía dependen de TODO el histórico (traslape de sensores, mediana por
 //! mes), así que no se calculan por CSV: después de cada importación con filas nuevas se
@@ -19,7 +19,7 @@
 //!      (valor − mediana) / (p75 − p25) con los años de referencia.
 //!
 //! Endpoints:
-//!   POST /harmonization/rebuild   recalcular a mano
+//!   POST /stats/harmonization/rebuild  recalcular a mano
 //!   GET  /stats/harmonization     última corrida, factores y validación
 //!   GET  /stats/harmonized        serie mensual armonizada con anomalía
 
@@ -632,7 +632,7 @@ fn report(conn: &Connection) -> Result<HarmonizationReport, ApiError> {
     })
 }
 
-/// POST /harmonization/rebuild
+/// POST /stats/harmonization/rebuild
 async fn rebuild(State(state): State<AppState>) -> Result<Json<RunSummary>, ApiError> {
     let cfg = state.cfg.clone();
     let run = state
@@ -666,7 +666,7 @@ async fn get_series(
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/harmonization/rebuild", post(rebuild))
+        .route("/stats/harmonization/rebuild", post(rebuild))
         .route("/stats/harmonization", get(get_report))
         .route("/stats/harmonized", get(get_series))
 }
@@ -733,6 +733,9 @@ mod tests {
             run.static_cells, 0,
             "menos de 12 meses con fuego: no se aplica el filtro"
         );
+        // Mismos formatos que el resto de la API.
+        assert_eq!(run.params["bbox"], "-90.13,13.15,-87.68,14.45");
+        assert_eq!(run.params["overlap_end"], "2025-12");
 
         let r = report(&conn).unwrap();
         assert_eq!(r.factors.len(), 12);

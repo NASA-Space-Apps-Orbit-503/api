@@ -39,7 +39,7 @@ API HTTP en Rust para el calendario de actividad de quema (NASA Space Apps · *H
 | Calendario de actividad desde los 2000 a hoy | `GET /stats/calendar` |
 | Qué meses y años tienen más fuegos | `GET /stats/summary` y `GET /stats/climatology` |
 | Detectar anomalías por celda y día frente a la historia | `GET /stats/anomalies` |
-| Serie mensual MODIS → VIIRS armonizada (factor por mes, validación, anomalía) | `GET /stats/harmonized`, `GET /stats/harmonization` |
+| Serie mensual armonizada VIIRS → MODIS (factor por mes, validación, anomalía) | `GET /stats/harmonized`, `GET /stats/harmonization` |
 | Descargar un CSV de los hotspots de la búsqueda | `GET /detections?format=csv` |
 | Datos de NASA FIRMS | `POST /detections/import`, `POST /firms/sync` y sincronización automática |
 
@@ -153,7 +153,7 @@ Cada importación que guarda filas nuevas (`POST /detections/import`, `POST /fir
 
 `status` de la corrida: `ok`, `no_overlap` (no hay meses completos de ambos sensores; la serie es solo MODIS) o `insufficient_data` (no hay datos de Aqua MODIS). Si el traslape tiene un solo año, no hay validación por año (no queda con qué calcular el factor sin ese año).
 
-La sincronización automática recalcula una sola vez por ciclo, al final de todas las fuentes. `POST /detections` (crear a mano) **no** recalcula. Tras eso, tras cambiar `HARMONIZE_*` o tras cargar con el CLI de DuckDB, usa `POST /harmonization/rebuild`.
+La sincronización automática recalcula una sola vez por ciclo, al final de todas las fuentes. `POST /detections` (crear a mano) **no** recalcula. Tras eso, tras cambiar `HARMONIZE_*` o tras cargar con el CLI de DuckDB, usa `POST /stats/harmonization/rebuild`.
 
 ---
 
@@ -265,7 +265,7 @@ export SV="bbox=-90.13,13.15,-87.68,14.45"     # El Salvador
 | GET    | `/stats/summary`      | Totales, años y meses con más actividad              |
 | GET    | `/stats/harmonized`   | Serie mensual armonizada con anomalía (`year`, `month`, `from`, `to`, `complete`) |
 | GET    | `/stats/harmonization` | Última corrida, factores por mes y validación por año |
-| POST   | `/harmonization/rebuild` | Recalcular la armonización                        |
+| POST   | `/stats/harmonization/rebuild` | Recalcular la armonización                        |
 | POST   | `/firms/sync`         | Descargar de FIRMS e importar                        |
 | GET    | `/health`             | Estado del servicio (siempre público)                |
 | GET    | `/tables`             | Tablas y vistas                                      |
@@ -447,6 +447,8 @@ curl -X POST "$API/firms/sync" -H "x-api-key: $KEY" -H "Content-Type: applicatio
   "received": 845, "valid": 845, "inserted": 845, "duplicates": 0, "invalid": 0, "errors": [] }
 ```
 
+Con `"harmonize": false` no recalcula la serie armonizada (por defecto sí, si hubo cambios).
+
 Fuentes: `MODIS_NRT`, `MODIS_SP`, `VIIRS_SNPP_NRT`, `VIIRS_SNPP_SP`, `VIIRS_NOAA20_NRT`, `VIIRS_NOAA20_SP`, `VIIRS_NOAA21_NRT`. Las `_SP` (procesamiento estándar) son el archivo histórico; las `_NRT`, los datos casi en tiempo real. FIRMS limita cada petición a pocos días y a un número de transacciones por cada 10 minutos.
 
 ### 3. Importar un CSV: `POST /detections/import`
@@ -462,7 +464,7 @@ curl -X POST "$API/detections/import" -H "x-api-key: $KEY" \
 - Si alguna fila es inválida, por defecto **no guarda nada** y responde `422` con la lista de errores (`line` y `error`). Con `?skip_invalid=true` guarda las válidas.
 - Las detecciones que ya existen se cuentan como `duplicates`.
 - Se lee la columna `type` del archivo SP (0 vegetación, 1 volcán, 2 fuente estática, 3 mar). Si la detección ya existía sin `type` (vino de un CSV NRT), se completa y se cuenta en `updated`.
-- Si hubo filas nuevas o completadas, recalcula la serie armonizada y devuelve su resumen en `harmonization` (o `harmonization_error`; las filas igual quedan guardadas). Para cargar muchos CSV seguidos, usa `?harmonize=false` y al final `POST /harmonization/rebuild`.
+- Si hubo filas nuevas o completadas, recalcula la serie armonizada y devuelve su resumen en `harmonization` (o `harmonization_error`; las filas igual quedan guardadas). Para cargar muchos CSV seguidos, usa `?harmonize=false` y al final `POST /stats/harmonization/rebuild`.
 - Para archivos de muchos MB, divídelos en partes o usa el CLI (siguiente punto).
 
 ### 4. Cargas muy grandes con el CLI de DuckDB
@@ -495,7 +497,7 @@ FROM read_csv('/data/fire_archive_M-C61.csv');
 docker compose start api
 ```
 
-DuckDB solo permite un proceso con escritura a la vez: por eso hay que detener la API antes. Al volver a arrancar, la API convierte `confidence` a `low` / `nominal` / `high`; después recalcula la serie con `POST /harmonization/rebuild`.
+DuckDB solo permite un proceso con escritura a la vez: por eso hay que detener la API antes. Al volver a arrancar, la API convierte `confidence` a `low` / `nominal` / `high`; después recalcula la serie con `POST /stats/harmonization/rebuild`.
 
 ---
 
