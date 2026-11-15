@@ -113,7 +113,8 @@ struct AnomalyId {
 
 impl AnomalyId {
     fn parse(text: &str) -> Result<Self, ApiError> {
-        let err = || ApiError::bad_request("id debe tener la forma YYYY-MM-DD_cellDeg_fila_columna");
+        let err =
+            || ApiError::bad_request("id debe tener la forma YYYY-MM-DD_cellDeg_fila_columna");
         let parts: Vec<&str> = text.split('_').collect();
         let [d, c, r, k] = parts.as_slice() else {
             return Err(err());
@@ -147,9 +148,13 @@ impl AnomalyParams {
     }
 
     fn min_baseline_years(&self) -> Result<i64, ApiError> {
-        let years = self.min_baseline_years.unwrap_or(DEFAULT_MIN_BASELINE_YEARS);
+        let years = self
+            .min_baseline_years
+            .unwrap_or(DEFAULT_MIN_BASELINE_YEARS);
         if !(1..=50).contains(&years) {
-            return Err(ApiError::bad_request("min_baseline_years debe estar entre 1 y 50"));
+            return Err(ApiError::bad_request(
+                "min_baseline_years debe estar entre 1 y 50",
+            ));
         }
         Ok(years)
     }
@@ -202,8 +207,7 @@ fn graded_cte(base: &SqlFilter, cell: f64) -> String {
     )
 }
 
-const SELECT_COLUMNS: &str =
-    "d::VARCHAR, r, k, n, expected, score, severity, max_frp, base_years";
+const SELECT_COLUMNS: &str = "d::VARCHAR, r, k, n, expected, score, severity, max_frp, base_years";
 
 fn map_item(cell: f64) -> impl FnMut(&duckdb::Row<'_>) -> duckdb::Result<AnomalyItem> {
     move |r| {
@@ -276,7 +280,7 @@ async fn list(
 ) -> Result<Json<AnomalyPage>, ApiError> {
     let (cell, min_years) = (ap.cell_deg()?, ap.min_baseline_years()?);
     let base = filter.to_sql_without_time(state.spatial)?;
-    let time = filter.time_sql("d", true)?;
+    let time = filter.time_sql("d")?;
 
     let min_score = lp.min_score.unwrap_or(DEFAULT_MIN_SCORE);
     if !min_score.is_finite() {
@@ -297,8 +301,9 @@ async fn list(
 
     let cte = graded_cte(&base, cell);
     let count_sql = format!("{cte} SELECT count(*)::BIGINT FROM graded {clause}");
-    let page_sql =
-        format!("{cte} SELECT {SELECT_COLUMNS} FROM graded {clause} ORDER BY {order} LIMIT ? OFFSET ?");
+    let page_sql = format!(
+        "{cte} SELECT {SELECT_COLUMNS} FROM graded {clause} ORDER BY {order} LIMIT ? OFFSET ?"
+    );
     let params = with_extra(&base.params, [Value::BigInt(min_years)]);
     let params = with_extra(&params, filter_params);
     let page_params = with_extra(
@@ -308,11 +313,10 @@ async fn list(
 
     let (total, items) = state
         .run_db(move |conn| {
-            let total: i64 = conn.query_row(
-                &count_sql,
-                duckdb::params_from_iter(params.iter()),
-                |r| r.get(0),
-            )?;
+            let total: i64 =
+                conn.query_row(&count_sql, duckdb::params_from_iter(params.iter()), |r| {
+                    r.get(0)
+                })?;
             let items = query_rows(conn, &page_sql, &page_params, map_item(cell))?;
             Ok((total, items))
         })
@@ -448,9 +452,13 @@ mod tests {
         )
         .unwrap();
 
-        let base = DetectionFilter::default().to_sql_without_time(false).unwrap();
+        let base = DetectionFilter::default()
+            .to_sql_without_time(false)
+            .unwrap();
         let cte = graded_cte(&base, 0.1);
-        let sql = format!("{cte} SELECT {SELECT_COLUMNS} FROM graded WHERE score >= ? ORDER BY score DESC");
+        let sql = format!(
+            "{cte} SELECT {SELECT_COLUMNS} FROM graded WHERE score >= ? ORDER BY score DESC"
+        );
         let params = with_extra(&base.params, [Value::BigInt(3), Value::Double(2.0)]);
         let items = query_rows(&conn, &sql, &params, map_item(0.1)).unwrap();
 

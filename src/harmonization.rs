@@ -21,7 +21,7 @@
 //! Endpoints:
 //!   POST /stats/harmonization/rebuild  recalcular a mano
 //!   GET  /stats/harmonization     última corrida, factores y validación
-//!   GET  /stats/harmonized        serie mensual armonizada con anomalía
+//!   GET  /stats/harmonized        serie mensual armonizada con anomalía (startDate + endDate)
 
 use std::sync::Mutex;
 
@@ -34,8 +34,8 @@ use duckdb::{types::Value, Connection, Row};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    analytics::query_rows, config::HarmonizationConfig, error::ApiError, filters::int_list,
-    state::AppState, validation::date,
+    analytics::query_rows, config::HarmonizationConfig, error::ApiError, filters::date_range,
+    state::AppState,
 };
 
 /// Un solo recálculo a la vez: dos importaciones simultáneas chocarían al reescribir las tablas.
@@ -500,18 +500,12 @@ pub struct HarmonizedSeries {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct SeriesParams {
-    /// Años separados por comas.
-    #[serde(alias = "filter[year]")]
-    pub year: Option<String>,
-    /// Meses 1..12 separados por comas.
-    #[serde(alias = "filter[month]")]
-    pub month: Option<String>,
-    /// YYYY-MM-DD: desde el mes de esa fecha.
-    #[serde(alias = "filter[from]")]
-    pub from: Option<String>,
-    /// YYYY-MM-DD: hasta el mes de esa fecha.
-    #[serde(alias = "filter[to]")]
-    pub to: Option<String>,
+    /// YYYY-MM-DD: desde el mes de esa fecha. Se envía junto con `endDate`.
+    #[serde(rename = "startDate", alias = "filter[startDate]")]
+    pub start_date: Option<String>,
+    /// YYYY-MM-DD: hasta el mes de esa fecha. Se envía junto con `startDate`.
+    #[serde(rename = "endDate", alias = "filter[endDate]")]
+    pub end_date: Option<String>,
     /// Si es true, solo meses completos.
     pub complete: Option<bool>,
 }
@@ -520,38 +514,15 @@ impl SeriesParams {
     fn to_sql(&self) -> Result<(String, Vec<Value>), ApiError> {
         let mut clauses = Vec::new();
         let mut params = Vec::new();
-        let years = int_list("year", self.year.as_deref(), 1900, 2100)?;
-        if !years.is_empty() {
-            clauses.push(format!(
-                "year(month_start) IN ({})",
-                years
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        let months = int_list("month", self.month.as_deref(), 1, 12)?;
-        if !months.is_empty() {
-            clauses.push(format!(
-                "month(month_start) IN ({})",
-                months
-                    .iter()
-                    .map(i64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        if let Some(from) = &self.from {
-            let from = date("from", from).map_err(ApiError::bad_request)?;
-            clauses
-                .push("month_start >= CAST(date_trunc('month', CAST(? AS DATE)) AS DATE)".into());
-            params.push(Value::Text(from));
-        }
-        if let Some(to) = &self.to {
-            let to = date("to", to).map_err(ApiError::bad_request)?;
-            clauses.push("month_start <= CAST(? AS DATE)".into());
-            params.push(Value::Text(to));
+        if let Some((start, end)) =
+            date_range(self.start_date.as_deref(), self.end_date.as_deref())?
+        {
+            clauses.push(
+                "month_start BETWEEN CAST(date_trunc('month', CAST(? AS DATE)) AS DATE) \
+                 AND CAST(? AS DATE)"
+                    .to_string(),
+            );
+            params.extend([Value::Text(start), Value::Text(end)]);
         }
         if self.complete == Some(true) {
             clauses.push("complete".into());
@@ -763,8 +734,8 @@ mod tests {
         let only = series(
             &conn,
             &SeriesParams {
-                year: Some("2021".into()),
-                month: Some("3".into()),
+                start_date: Some("2021-03-10".into()),
+                end_date: Some("2021-03-31".into()),
                 ..Default::default()
             },
         )
@@ -891,21 +862,20 @@ mod tests {
     #[test]
     fn filtros_de_la_serie() {
         assert!(SeriesParams {
-            month: Some("13".into()),
+            start_date: Some("2020-03-15".into()),
             ..Default::default()
         }
         .to_sql()
         .is_err());
         let (clause, params) = SeriesParams {
-            year: Some("2020,2021".into()),
-            from: Some("2020-03-15".into()),
+            start_date: Some("2020-03-15".into()),
+            end_date: Some("2021-12-31".into()),
             complete: Some(true),
-            ..Default::default()
         }
         .to_sql()
         .unwrap();
-        assert!(clause.contains("year(month_start) IN (2020, 2021)"));
+        assert!(clause.contains("month_start BETWEEN"));
         assert!(clause.ends_with("complete"));
-        assert_eq!(params.len(), 1);
+        assert_eq!(params.len(), 2);
     }
 }

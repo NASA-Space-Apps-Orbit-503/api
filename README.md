@@ -35,7 +35,7 @@ API HTTP en Rust para el calendario de actividad de quema (NASA Space Apps · *H
 |---|---|
 | Armonizar MODIS y VIIRS en una serie consistente | `metric=cells` en todo `/stats/*` y vista `detections_harmonized` |
 | Elegir un área (dibujarla o con latitud y longitud) | Filtros `bbox`, `lat`+`lon`+`radius_km` o `polygon` (GeoJSON) |
-| Elegir un rango de fechas | Filtros `from` y `to` |
+| Elegir un rango de fechas | Filtros `startDate` y `endDate` (las dos juntas) |
 | Calendario de actividad desde los 2000 a hoy | `GET /stats/calendar` |
 | Qué meses y años tienen más fuegos | `GET /stats/summary` y `GET /stats/climatology` |
 | Detectar anomalías por celda y día frente a la historia | `GET /stats/anomalies` |
@@ -249,7 +249,7 @@ export SV="bbox=-90.13,13.15,-87.68,14.45"     # El Salvador
 | POST   | `/detections`                      | Crear una (objeto) o varias (arreglo)           |
 | POST   | `/detections/import`               | Importar un CSV de FIRMS                        |
 | GET    | `/detections/{id}`                 | Obtener una                                     |
-| GET    | `/burning-activity-stats`          | Listar (`?year=&month=`)                        |
+| GET    | `/burning-activity-stats`          | Listar (`?startDate=&endDate=`)                 |
 | POST   | `/burning-activity-stats`          | Crear una (objeto) o varias (arreglo)           |
 | POST   | `/burning-activity-stats/rebuild`  | Recalcular desde las detecciones                |
 | GET    | `/burning-activity-stats/{id}`     | Obtener una                                     |
@@ -263,7 +263,7 @@ export SV="bbox=-90.13,13.15,-87.68,14.45"     # El Salvador
 | GET    | `/stats/anomalies`    | Anomalías por celda y día (paginado, ordenable)      |
 | GET    | `/stats/anomalies/{id}` | Una anomalía por id                                |
 | GET    | `/stats/summary`      | Totales, años y meses con más actividad              |
-| GET    | `/stats/harmonized`   | Serie mensual armonizada con anomalía (`year`, `month`, `from`, `to`, `complete`) |
+| GET    | `/stats/harmonized`   | Serie mensual armonizada con anomalía (`startDate`, `endDate`, `complete`) |
 | GET    | `/stats/harmonization` | Última corrida, factores por mes y validación por año |
 | POST   | `/stats/harmonization/rebuild` | Recalcular la armonización                        |
 | POST   | `/firms/sync`         | Descargar de FIRMS e importar                        |
@@ -305,10 +305,10 @@ curl -H "x-api-key: $KEY" "$API/instruments/1"
 
 ```bash
 # JSON paginado: {"total": 1234, "limit": 100, "offset": 0, "items": [...]}
-curl -H "x-api-key: $KEY" "$API/detections?$SV&from=2024-01-01&to=2024-04-30&min_confidence=nominal&limit=100"
+curl -H "x-api-key: $KEY" "$API/detections?$SV&startDate=2024-01-01&endDate=2024-04-30&min_confidence=nominal&limit=100"
 
 # CSV descargable con todos los hotspots de la búsqueda
-curl -H "x-api-key: $KEY" -OJ "$API/detections?$SV&from=2024-01-01&to=2024-04-30&format=csv"
+curl -H "x-api-key: $KEY" -OJ "$API/detections?$SV&startDate=2024-01-01&endDate=2024-04-30&format=csv"
 ```
 
 ---
@@ -322,22 +322,20 @@ Los aceptan `GET /detections`, todo `/stats/*` y `POST /burning-activity-stats/r
 | `bbox`           | `-90.13,13.15,-87.68,14.45`           | Rectángulo oeste,sur,este,norte |
 | `lat`, `lon`, `radius_km` | `lat=13.7&lon=-89.2&radius_km=25` | Círculo alrededor de un punto |
 | `polygon`        | `{"type":"Polygon","coordinates":[...]}` (codificado en la URL) | Área dibujada en el mapa (GeoJSON) |
-| `from`, `to`     | `2001-01-01`, `2024-12-31`            | Rango de fechas inclusivo |
-| `date`           | `2024-03-14`                          | Un día exacto |
-| `year`           | `2023,2024`                           | Uno o varios años |
-| `month`          | `3,4`                                 | Uno o varios meses (1..12) |
-| `day`            | `1,15`                                | Uno o varios días del mes (1..31) |
+| `startDate`, `endDate` | `2001-01-01`, `2024-12-31`      | Rango de fechas inclusivo (YYYY-MM-DD). **Las dos juntas o ninguna**: con una sola responde `400`. Sin fechas, todo el histórico |
 | `instrument`     | `MODIS,VIIRS`                         | Uno o varios instrumentos |
 | `satellite`      | `N,N20,Terra`                         | Uno o varios satélites |
 | `min_confidence` | `low` \| `nominal` \| `high`          | Confianza mínima armonizada |
 | `daynight`       | `D` \| `N`                            | Solo de día o de noche |
 
-El área se indica de **una sola** forma. Los filtros se combinan con AND. `GET /burning-activity-stats` acepta `year`, `month` y `day`.
+El área se indica de **una sola** forma. Los filtros se combinan con AND. `GET /burning-activity-stats` y `GET /stats/harmonized` aceptan solo `startDate` y `endDate` (en la serie armonizada, el mes de cada fecha).
+
+Los filtros viejos `from`, `to`, `date`, `year`, `month` y `day` ya no existen y responden `400` (para que nadie reciba datos sin filtrar creyendo que filtró).
 
 **Sintaxis `filter[...]`** (estilo spatie/laravel-query-builder): cada filtro también se puede mandar como `filter[nombre]=valor`. Un `filter[...]` desconocido responde `400` con la lista de permitidos, en vez de ignorarse.
 
 ```bash
-curl -H "x-api-key: $KEY" "$API/detections?filter[bbox]=-90.13,13.15,-87.68,14.45&filter[month]=3&filter[day]=14"
+curl -H "x-api-key: $KEY" "$API/detections?filter[bbox]=-90.13,13.15,-87.68,14.45&filter[startDate]=2024-03-14&filter[endDate]=2024-03-14"
 ```
 
 Para las estadísticas, además:
@@ -352,7 +350,8 @@ Desde JavaScript, un polígono dibujado (por ejemplo con Leaflet o MapLibre) se 
 ```ts
 const params = new URLSearchParams({
   polygon: JSON.stringify(feature.geometry),  // { type: "Polygon", coordinates: [...] }
-  from: "2001-01-01",
+  startDate: "2001-01-01",
+  endDate: "2024-12-31",
 });
 fetch(`${API}/stats/calendar?${params}`);
 ```
@@ -368,13 +367,13 @@ Todas se calculan en el momento para el área y filtros que pidas.
 Una fila por mes (o por día con `granularity=day`), **incluidos los meses sin actividad con `count: 0`**. Es exactamente la matriz años × meses que se pinta con la rampa de colores.
 
 ```bash
-curl -H "x-api-key: $KEY" "$API/stats/calendar?$SV&from=2001-01-01"
+curl -H "x-api-key: $KEY" "$API/stats/calendar?$SV&startDate=2001-01-01&endDate=2024-12-31"
 ```
 
 ```json
 {
   "metric": "cells", "cell_deg": 0.01, "granularity": "month",
-  "from": "2001-01-01", "to": null,
+  "from": "2001-01-01", "to": "2024-12-31",
   "items": [
     { "year": 2001, "month": 1, "day": null, "count": 12, "max_frp": 45.1, "active_days": 6 },
     { "year": 2001, "month": 2, "day": null, "count": 87, "max_frp": 120.4, "active_days": 19 }
@@ -392,7 +391,7 @@ Divide el área en celdas de `cell_deg` grados (por defecto `0.1` ≈ 11 km) y, 
 
 - `score = 2 · (√(observed + 3/8) − √(expected + 3/8))`: desviación de Poisson con la transformación de Anscombe. Se lee como un z-score y está definida aunque lo esperado sea 0.
 - `severity`: `low` ≥ 2, `moderate` ≥ 3, `high` ≥ 5, `extreme` ≥ 8 (por debajo, `normal`).
-- Los filtros de tiempo eligen **qué días** se reportan; la referencia siempre usa todos los años anteriores.
+- `startDate` y `endDate` eligen **qué días** se reportan; la referencia siempre usa todos los años anteriores.
 
 | Parámetro            | Por defecto | Descripción |
 |----------------------|-------------|-------------|
@@ -404,7 +403,7 @@ Divide el área en celdas de `cell_deg` grados (por defecto `0.1` ≈ 11 km) y, 
 | `limit`, `offset`    | `100`, `0`  | Paginación |
 
 ```bash
-curl -H "x-api-key: $KEY" "$API/stats/anomalies?$SV&year=2024&month=3&severity=high,extreme"
+curl -H "x-api-key: $KEY" "$API/stats/anomalies?$SV&startDate=2024-03-01&endDate=2024-03-31&severity=high,extreme"
 ```
 
 ```json
@@ -545,17 +544,17 @@ const api = createClient<paths>({ baseUrl: import.meta.env.VITE_API_URL });
 
 // Calendario de El Salvador desde 2001
 const { data: calendar } = await api.GET("/stats/calendar", {
-  params: { query: { bbox: "-90.13,13.15,-87.68,14.45", from: "2001-01-01" } },
+  params: { query: { bbox: "-90.13,13.15,-87.68,14.45", startDate: "2001-01-01", endDate: "2024-12-31" } },
 });
 
 // Anomalías graves de marzo de 2024
 const { data: anomalies } = await api.GET("/stats/anomalies", {
-  params: { query: { bbox: "-90.13,13.15,-87.68,14.45", year: "2024", month: "3", severity: "high,extreme" } },
+  params: { query: { bbox: "-90.13,13.15,-87.68,14.45", startDate: "2024-03-01", endDate: "2024-03-31", severity: "high,extreme" } },
 });
 
 // Enlace de descarga del CSV de la búsqueda actual
 const csvUrl = `${import.meta.env.VITE_API_URL}/detections?` +
-  new URLSearchParams({ bbox: "-90.13,13.15,-87.68,14.45", from: "2024-01-01", format: "csv" });
+  new URLSearchParams({ bbox: "-90.13,13.15,-87.68,14.45", startDate: "2024-01-01", endDate: "2024-12-31", format: "csv" });
 ```
 
 Con `PUBLIC_READ=true` no hace falta mandar la API key desde el navegador. Si cambias algo en Rust, actualiza `openapi.yaml` y vuelve a generar los tipos.
