@@ -23,6 +23,7 @@ use crate::{
     filters::DetectionFilter,
     firms, harmonization,
     state::AppState,
+    timestamp::ms_to_date,
     validation::{confidence, date, hhmm, in_range, optional_min, optional_text, required_text},
 };
 
@@ -34,8 +35,8 @@ pub struct Detection {
     pub bright_ti4: Option<f64>,
     pub scan: Option<f64>,
     pub track: Option<f64>,
-    /// YYYY-MM-DD
-    pub acq_date: String,
+    /// Momento de la adquisición (acq_date + acq_time) en epoch ms UTC.
+    pub acq_date: i64,
     /// HHMM en UTC
     pub acq_time: String,
     pub satellite: String,
@@ -85,7 +86,10 @@ pub struct NewDetection {
 /// Columnas en el orden que espera `from_row`.
 macro_rules! columns {
     () => {
-        "id, latitude, longitude, bright_ti4, scan, track, acq_date::VARCHAR, acq_time, \
+        "id, latitude, longitude, bright_ti4, scan, track, \
+         epoch_ms(acq_date::TIMESTAMP \
+             + to_minutes(CAST(substr(lpad(acq_time, 4, '0'), 1, 2) AS BIGINT) * 60 \
+                        + CAST(substr(lpad(acq_time, 4, '0'), 3, 2) AS BIGINT))), acq_time, \
          satellite, instrument, confidence, \"version\", bright_ti5, frp, daynight, \"type\""
     };
 }
@@ -247,7 +251,7 @@ async fn search(
                     w.write_record(CSV_HEADER).map_err(csv_err)?;
                 }
                 for d in &page.items {
-                    w.serialize(d).map_err(csv_err)?;
+                    w.serialize(CsvRow::from(d)).map_err(csv_err)?;
                 }
                 w.into_inner()
                     .map_err(|e| ApiError::internal(e.to_string()))
@@ -294,6 +298,52 @@ const CSV_HEADER: [&str; 16] = [
     "daynight",
     "type",
 ];
+
+/// Fila del CSV: igual que `Detection`, pero con `acq_date` como YYYY-MM-DD (formato de FIRMS),
+/// para que el archivo se pueda volver a subir a /detections/import.
+#[derive(Serialize)]
+struct CsvRow<'a> {
+    id: i64,
+    latitude: f64,
+    longitude: f64,
+    bright_ti4: Option<f64>,
+    scan: Option<f64>,
+    track: Option<f64>,
+    acq_date: String,
+    acq_time: &'a str,
+    satellite: &'a str,
+    instrument: &'a str,
+    confidence: Option<&'a str>,
+    version: Option<&'a str>,
+    bright_ti5: Option<f64>,
+    frp: Option<f64>,
+    daynight: Option<&'a str>,
+    #[serde(rename = "type")]
+    fire_type: Option<i32>,
+}
+
+impl<'a> From<&'a Detection> for CsvRow<'a> {
+    fn from(d: &'a Detection) -> Self {
+        Self {
+            id: d.id,
+            latitude: d.latitude,
+            longitude: d.longitude,
+            bright_ti4: d.bright_ti4,
+            scan: d.scan,
+            track: d.track,
+            acq_date: ms_to_date(d.acq_date),
+            acq_time: &d.acq_time,
+            satellite: &d.satellite,
+            instrument: &d.instrument,
+            confidence: d.confidence.as_deref(),
+            version: d.version.as_deref(),
+            bright_ti5: d.bright_ti5,
+            frp: d.frp,
+            daynight: d.daynight.as_deref(),
+            fire_type: d.fire_type,
+        }
+    }
+}
 
 fn csv_err(e: csv::Error) -> ApiError {
     ApiError::internal(format!("error al generar el CSV: {e}"))
@@ -489,4 +539,56 @@ pub fn routes() -> Router<AppState> {
         .route("/detections", post(crud::create::<Detection>).get(search))
         .route("/detections/import", post(import))
         .route("/detections/{id}", get(crud::get_one::<Detection>))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timestamp::date_ms;
+
+    fn new_detection(date: &str, time: &str) -> NewDetection {
+        NewDetection {
+            latitude: 13.69,
+            longitude: -89.21,
+            bright_ti4: None,
+            scan: None,
+            track: None,
+            acq_date: date.into(),
+            acq_time: time.into(),
+            satellite: "N".into(),
+            instrument: "VIIRS".into(),
+            confidence: Some("n".into()),
+            version: None,
+            bright_ti5: None,
+            frp: Some(3.2),
+            daynight: Some("D".into()),
+            fire_type: None,
+        }
+    }
+
+    #[test]
+    fn acq_date_is_the_acquisition_instant_in_epoch_ms() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../schema.sql")).unwrap();
+
+        let d = Detection::validate(new_detection("2024-03-14", "748")).unwrap();
+        let created =
+            Detection::insert(&mut conn.prepare(Detection::INSERT_SQL).unwrap(), &d).unwrap();
+        // 2024-03-14 07:48 UTC.
+        let expected = date_ms("2024-03-14").unwrap() + (7 * 60 + 48) * 60_000;
+        assert_eq!(created.acq_date, expected);
+        assert_eq!(created.acq_time, "0748");
+
+        let read: Detection = conn
+            .query_row(
+                Detection::SELECT_BY_ID_SQL,
+                [created.id],
+                Detection::from_row,
+            )
+            .unwrap();
+        assert_eq!(read.acq_date, expected);
+
+        // El CSV vuelve al formato de FIRMS.
+        assert_eq!(CsvRow::from(&read).acq_date, "2024-03-14");
+    }
 }

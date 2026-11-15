@@ -17,7 +17,7 @@ pub const FIRMS_SOURCES: &[&str] = &[
 
 /// Parámetros de la armonización VIIRS → MODIS (`src/harmonization.rs`).
 /// Se serializan con los mismos formatos que el resto de la API: `bbox` como
-/// "oeste,sur,este,norte" y `overlap_end` como YYYY-MM.
+/// "oeste,sur,este,norte" y las fechas (`snpp_end`, `overlap_end`) como epoch ms UTC.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HarmonizationConfig {
     /// oeste, sur, este, norte. None = sin recorte por área.
@@ -35,11 +35,12 @@ pub struct HarmonizationConfig {
     /// (con pocos meses, toda celda con fuego parecería estática).
     pub static_min_months: i64,
     /// Último día con datos de Suomi NPP (exclusivo), YYYY-MM-DD.
+    #[serde(serialize_with = "epoch_ms")]
     pub snpp_end: String,
     /// Satélites VIIRS de referencia, en orden de prioridad.
     pub viirs_priority: Vec<String>,
     /// Último mes usado para calcular el factor, como YYYY-MM-01.
-    #[serde(serialize_with = "year_month")]
+    #[serde(serialize_with = "epoch_ms")]
     pub overlap_end: String,
     /// Si un mes tiene menos celdas-día VIIRS en el traslape, usa el factor de su época.
     pub min_cells_month: f64,
@@ -58,8 +59,11 @@ fn bbox_text<S: serde::Serializer>(b: &Option<[f64; 4]>, s: S) -> Result<S::Ok, 
     }
 }
 
-fn year_month<S: serde::Serializer>(d: &str, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(d.get(..7).unwrap_or(d))
+fn epoch_ms<S: serde::Serializer>(d: &str, s: S) -> Result<S::Ok, S::Error> {
+    match crate::timestamp::date_ms(d) {
+        Some(ms) => s.serialize_i64(ms),
+        None => s.serialize_str(d),
+    }
 }
 
 impl HarmonizationConfig {

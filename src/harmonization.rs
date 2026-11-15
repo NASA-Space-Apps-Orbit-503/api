@@ -272,8 +272,8 @@ DROP TABLE IF EXISTS h_validation;";
 /// Resumen de una corrida.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunSummary {
-    /// Momento del cálculo (UTC).
-    pub computed_at: String,
+    /// Momento del cálculo en epoch ms UTC.
+    pub computed_at: i64,
     /// ok | no_overlap (solo MODIS, sin factor) | insufficient_data (sin datos de Aqua MODIS)
     pub status: String,
     /// Detecciones tras quitar duplicados y aplicar el área.
@@ -285,11 +285,11 @@ pub struct RunSummary {
     pub after_static: i64,
     /// Detecciones usadas en la serie (Aqua + el VIIRS de referencia).
     pub used: i64,
-    /// YYYY-MM
-    pub first_month: Option<String>,
-    pub last_month: Option<String>,
-    pub overlap_start: Option<String>,
-    pub overlap_end: Option<String>,
+    /// Primer día de cada mes en epoch ms UTC.
+    pub first_month: Option<i64>,
+    pub last_month: Option<i64>,
+    pub overlap_start: Option<i64>,
+    pub overlap_end: Option<i64>,
     pub overlap_months: i64,
     /// Diferencia anual promedio de VIIRS crudo contra MODIS en el traslape (%).
     pub mean_raw_diff_pct: Option<f64>,
@@ -301,10 +301,10 @@ pub struct RunSummary {
     pub params: serde_json::Value,
 }
 
-const RUN_COLUMNS: &str = "strftime(computed_at, '%Y-%m-%dT%H:%M:%SZ'), status, detections, \
+const RUN_COLUMNS: &str = "epoch_ms(computed_at), status, detections, \
     after_confidence, after_type, static_cells, after_static, used, \
-    strftime(first_month, '%Y-%m'), strftime(last_month, '%Y-%m'), \
-    strftime(overlap_start, '%Y-%m'), strftime(overlap_end, '%Y-%m'), overlap_months, \
+    epoch_ms(first_month::TIMESTAMP), epoch_ms(last_month::TIMESTAMP), \
+    epoch_ms(overlap_start::TIMESTAMP), epoch_ms(overlap_end::TIMESTAMP), overlap_months, \
     mean_raw_diff_pct, mean_abs_harmonized_diff_pct, correlation, params";
 
 fn run_from_row(row: &Row<'_>) -> duckdb::Result<RunSummary> {
@@ -470,8 +470,8 @@ pub struct HarmonizationReport {
 
 #[derive(Debug, Serialize)]
 pub struct HarmonizedMonth {
-    /// YYYY-MM
-    pub month: String,
+    /// Primer día del mes en epoch ms UTC.
+    pub month: i64,
     /// Celdas-día MODIS Aqua.
     pub modis: Option<f64>,
     /// Celdas-día VIIRS (satélite de referencia).
@@ -539,7 +539,7 @@ impl SeriesParams {
 fn series(conn: &Connection, p: &SeriesParams) -> Result<Vec<HarmonizedMonth>, ApiError> {
     let (clause, params) = p.to_sql()?;
     let sql = format!(
-        "SELECT strftime(month_start, '%Y-%m'), modis, viirs, harmonized, source, complete, \
+        "SELECT epoch_ms(month_start::TIMESTAMP), modis, viirs, harmonized, source, complete, \
                 median, p25, p75, anomaly, \"level\" \
          FROM harmonized_monthly {clause} ORDER BY month_start"
     );
@@ -645,6 +645,7 @@ pub fn routes() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timestamp::date_ms;
 
     fn insert(conn: &Connection, lat: f64, lon: f64, day: &str, time: &str, sat: &str, inst: &str) {
         conn.execute(
@@ -697,8 +698,8 @@ mod tests {
 
         let run = recompute(&mut conn, &cfg()).unwrap();
         assert_eq!(run.status, "ok");
-        assert_eq!(run.overlap_start.as_deref(), Some("2021-01"));
-        assert_eq!(run.overlap_end.as_deref(), Some("2021-12"));
+        assert_eq!(run.overlap_start, date_ms("2021-01"));
+        assert_eq!(run.overlap_end, date_ms("2021-12"));
         assert_eq!(run.overlap_months, 12);
         assert_eq!(
             run.static_cells, 0,
@@ -706,7 +707,8 @@ mod tests {
         );
         // Mismos formatos que el resto de la API.
         assert_eq!(run.params["bbox"], "-90.13,13.15,-87.68,14.45");
-        assert_eq!(run.params["overlap_end"], "2025-12");
+        assert_eq!(run.params["overlap_end"], date_ms("2025-12").unwrap());
+        assert_eq!(run.params["snpp_end"], date_ms("2026-11-02").unwrap());
 
         let r = report(&conn).unwrap();
         assert_eq!(r.factors.len(), 12);
@@ -723,10 +725,16 @@ mod tests {
         assert!((jan.factor.unwrap() - 63.0 / 33.0).abs() < 1e-9);
 
         let all = series(&conn, &SeriesParams::default()).unwrap();
-        let m2020_03 = all.iter().find(|m| m.month == "2020-03").unwrap();
+        let m2020_03 = all
+            .iter()
+            .find(|m| Some(m.month) == date_ms("2020-03"))
+            .unwrap();
         assert_eq!(m2020_03.source, "modis");
         assert_eq!(m2020_03.harmonized, Some(1.0));
-        let m2021_03 = all.iter().find(|m| m.month == "2021-03").unwrap();
+        let m2021_03 = all
+            .iter()
+            .find(|m| Some(m.month) == date_ms("2021-03"))
+            .unwrap();
         assert_eq!(m2021_03.source, "viirs_factor");
         assert_eq!(m2021_03.viirs, Some(31.0));
         assert!((m2021_03.harmonized.unwrap() - 62.0).abs() < 1e-9);

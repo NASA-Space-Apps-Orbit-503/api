@@ -15,6 +15,7 @@ mod filters;
 mod firms;
 mod harmonization;
 mod state;
+mod timestamp;
 mod validation;
 
 use std::{

@@ -26,6 +26,7 @@ use crate::{
     error::ApiError,
     filters::{opt_text, DetectionFilter, SqlFilter},
     state::AppState,
+    timestamp::opt_date_ms,
 };
 
 // ---------------------------------------------------------------- Métrica
@@ -160,10 +161,8 @@ pub struct CalendarParams {
 
 #[derive(Debug, Serialize)]
 pub struct CalendarPoint {
-    pub year: i64,
-    pub month: i64,
-    /// Solo con granularity=day; null por mes.
-    pub day: Option<i64>,
+    /// Inicio del periodo (día o primer día del mes) en epoch ms UTC.
+    pub date: i64,
     pub count: i64,
     pub max_frp: Option<f64>,
     /// Solo por mes: días del mes con al menos un hotspot; null por día.
@@ -175,8 +174,9 @@ pub struct CalendarResponse {
     pub metric: &'static str,
     pub cell_deg: Option<f64>,
     pub granularity: &'static str,
-    pub from: Option<String>,
-    pub to: Option<String>,
+    /// Límites del filtro startDate/endDate en epoch ms UTC.
+    pub from: Option<i64>,
+    pub to: Option<i64>,
     pub items: Vec<CalendarPoint>,
 }
 
@@ -204,7 +204,7 @@ async fn calendar(
          agg AS (SELECT date_trunc('{unit}', d)::DATE AS p, sum(n)::BIGINT AS n, \
                         max(max_frp) AS max_frp, count(*)::BIGINT AS active_days FROM daily GROUP BY 1), \
          {bounds}, {series} \
-         SELECT year(s.p)::BIGINT, month(s.p)::BIGINT, day(s.p)::BIGINT, coalesce(a.n, 0)::BIGINT, \
+         SELECT epoch_ms(s.p::TIMESTAMP), coalesce(a.n, 0)::BIGINT, \
                 a.max_frp::DOUBLE, coalesce(a.active_days, 0)::BIGINT \
          FROM series s LEFT JOIN agg a ON a.p = s.p ORDER BY s.p",
         daily = daily_sql(&sql, &metric),
@@ -217,12 +217,10 @@ async fn calendar(
         .run_db(move |conn| {
             query_rows(conn, &query, &params, |r| {
                 Ok(CalendarPoint {
-                    year: r.get(0)?,
-                    month: r.get(1)?,
-                    day: if by_day { Some(r.get(2)?) } else { None },
-                    count: r.get(3)?,
-                    max_frp: r.get(4)?,
-                    active_days: if by_day { None } else { Some(r.get(5)?) },
+                    date: r.get(0)?,
+                    count: r.get(1)?,
+                    max_frp: r.get(2)?,
+                    active_days: if by_day { None } else { Some(r.get(3)?) },
                 })
             })
         })
@@ -232,8 +230,8 @@ async fn calendar(
         metric: metric.name(),
         cell_deg: metric.cell_deg(),
         granularity: unit,
-        from: sql.from,
-        to: sql.to,
+        from: opt_date_ms(sql.from.as_deref()),
+        to: opt_date_ms(sql.to.as_deref()),
         items,
     }))
 }
@@ -261,8 +259,9 @@ pub struct MonthClimatology {
 pub struct ClimatologyResponse {
     pub metric: &'static str,
     pub cell_deg: Option<f64>,
-    pub from: Option<String>,
-    pub to: Option<String>,
+    /// Límites del filtro startDate/endDate en epoch ms UTC.
+    pub from: Option<i64>,
+    pub to: Option<i64>,
     pub months: Vec<MonthClimatology>,
 }
 
@@ -310,8 +309,8 @@ async fn climatology(
     Ok(Json(ClimatologyResponse {
         metric: metric.name(),
         cell_deg: metric.cell_deg(),
-        from: sql.from,
-        to: sql.to,
+        from: opt_date_ms(sql.from.as_deref()),
+        to: opt_date_ms(sql.to.as_deref()),
         months,
     }))
 }
@@ -338,8 +337,8 @@ pub struct YearTotal {
 
 #[derive(Debug, Serialize)]
 pub struct MonthTotal {
-    pub year: i64,
-    pub month: i64,
+    /// Primer día del mes en epoch ms UTC.
+    pub date: i64,
     pub count: i64,
     pub max_frp: Option<f64>,
 }
@@ -352,8 +351,9 @@ pub struct SummaryResponse {
     pub detections: i64,
     /// Total según la métrica elegida.
     pub total: i64,
-    pub first_date: Option<String>,
-    pub last_date: Option<String>,
+    /// Primer y último día con detecciones, en epoch ms UTC.
+    pub first_date: Option<i64>,
+    pub last_date: Option<i64>,
     pub max_frp: Option<f64>,
     pub by_instrument: Vec<InstrumentCount>,
     pub top_years: Vec<YearTotal>,
@@ -374,15 +374,20 @@ async fn summary(
 
     let resp = state
         .run_db(move |conn| {
-            let (detections, first_date, last_date, max_frp): (i64, Option<String>, Option<String>, Option<f64>) =
-                conn.query_row(
-                    &format!(
-                        "SELECT count(*)::BIGINT, min(acq_date)::VARCHAR, max(acq_date)::VARCHAR, max(frp)::DOUBLE \
+            let (detections, first_date, last_date, max_frp): (
+                i64,
+                Option<i64>,
+                Option<i64>,
+                Option<f64>,
+            ) = conn.query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT, epoch_ms(min(acq_date)::TIMESTAMP), \
+                                epoch_ms(max(acq_date)::TIMESTAMP), max(frp)::DOUBLE \
                          FROM detections_harmonized {clause}"
-                    ),
-                    duckdb::params_from_iter(params.iter()),
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )?;
+                ),
+                duckdb::params_from_iter(params.iter()),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
 
             let by_instrument = query_rows(
                 conn,
@@ -423,17 +428,18 @@ async fn summary(
             let top_months = query_rows(
                 conn,
                 &format!(
-                    "WITH daily AS ({daily}) SELECT year(d)::BIGINT AS y, month(d)::BIGINT AS m, \
-                     sum(n)::BIGINT AS t, max(max_frp)::DOUBLE FROM daily \
-                     GROUP BY 1, 2 ORDER BY t DESC, y, m LIMIT ?"
+                    "WITH daily AS ({daily}), \
+                     top AS (SELECT date_trunc('month', d)::DATE AS m, sum(n)::BIGINT AS t, \
+                                    max(max_frp)::DOUBLE AS f FROM daily \
+                             GROUP BY 1 ORDER BY t DESC, m LIMIT ?) \
+                     SELECT epoch_ms(m::TIMESTAMP), t, f FROM top ORDER BY t DESC, m"
                 ),
                 &with_extra(&params, [Value::BigInt(top)]),
                 |r| {
                     Ok(MonthTotal {
-                        year: r.get(0)?,
-                        month: r.get(1)?,
-                        count: r.get(2)?,
-                        max_frp: r.get(3)?,
+                        date: r.get(0)?,
+                        count: r.get(1)?,
+                        max_frp: r.get(2)?,
                     })
                 },
             )?;

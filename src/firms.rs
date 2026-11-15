@@ -222,7 +222,8 @@ pub struct SyncResult {
     pub source: String,
     pub area: String,
     pub days: u32,
-    pub date: Option<String>,
+    /// Día inicial pedido, en epoch ms UTC. Null = los días más recientes.
+    pub date: Option<i64>,
     #[serde(flatten)]
     pub import: ImportResult,
 }
@@ -267,7 +268,7 @@ pub async fn sync_once(
         source,
         area,
         days,
-        date: date_from,
+        date: crate::timestamp::opt_date_ms(date_from.as_deref()),
         import,
     })
 }
